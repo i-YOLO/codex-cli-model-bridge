@@ -11,6 +11,8 @@ Codex Desktop / CLI (model_provider = openai)
 
 The isolated `cli-proxy` profile talks to 8317 with command-backed authentication. It is created before Desktop activation and remains the fallback.
 
+For Desktop compaction, prefer Python 3.14 or newer so the standard-library runtime can decode Codex `Content-Encoding: zstd` requests. Older interpreters may keep ordinary traffic alive by forwarding an unknown encoding unchanged, but the third-party synthetic-compaction gate remains unproven until a real zstd v2 and replay request succeeds.
+
 ## Bootstrap behavior
 
 `bootstrap` first discovers an existing CLIProxyAPI binary, config, and service. It adopts them without creating a second instance or auth directory.
@@ -27,9 +29,22 @@ Do not install over an existing binary unless the user explicitly requested an u
 
 The 8318 proxy uses the same service family. A service file is part of its deployment transaction.
 
+### Safe 8318 handoff
+
+Treat a live 8318 replacement as a service migration, not a normal file copy.
+
+1. Finish code changes and pass syntax plus offline tests.
+2. Confirm 8318 is listening and `/v1/models` returns 200. If 8318 is absent, stop; do not recover it without a separate user decision.
+3. Run `compaction configure` without `--apply`. Report the complete config diff, config SHA-256, transaction ID, exact backups, apply command, and rollback command.
+4. Wait for explicit user approval. Apply must reuse the approved SHA and transaction ID.
+5. On macOS, wait up to 10 seconds for asynchronous `bootout` removal before bootstrap; retry bootstrap only within the script's fixed bound.
+6. Accept the handoff only when the service is running, `/v1/models` is 200, and the actual config diff exactly matches the preview.
+
+Do not restart CLIProxyAPI merely to deploy the 8318 adapter. A CLIProxyAPI restart is a separate operation requiring explicit authorization and its own impact statement.
+
 ## Transaction rules
 
-Every apply operation records exact affected paths, before/after SHA-256 values, owner-only backups, and services created by the transaction. Rollback checks the after hash before restoring. `--force` is for a user-confirmed overwrite only.
+Every apply operation records exact affected paths, before/after SHA-256 values, owner-only backups, and affected services. Rollback checks the after hash before restoring. A compaction apply that replaces an existing service records that prior definition and restarts it after rollback. Failed transactions are persisted as `status=failed` with rollback and service-restoration outcomes. `--force` is for a user-confirmed overwrite only.
 
 Provider configs and their backups may contain API keys and must remain owner-only; transaction JSON never includes secret values.
 

@@ -1,16 +1,16 @@
-# Codex CLI Model Bridge V2
+# Codex CLI Model Bridge V2.1
 
 Deploy verified Gemini, DeepSeek, GLM, Grok, or compatible custom models into Codex CLI and the Codex Desktop model picker while preserving ChatGPT login and existing task history.
 
 Official repository: [i-YOLO/codex-cli-model-bridge](https://github.com/i-YOLO/codex-cli-model-bridge)
 
-This is an MIT-licensed derivative of [Zhijian AI's `codex-cli-model-bridge`](https://github.com/zjp1997720/zhijian-skills/tree/main/skills/codex-cli-model-bridge). V2 adds zero-to-one installation, per-user services for macOS/Windows/Linux, API-key and OAuth provider onboarding, transactional rollback, a dependency-free Python transparent proxy, generic ProviderSpec support, and end-to-end Codex verification. See [NOTICE](NOTICE).
+This is an MIT-licensed derivative of [Zhijian AI's `codex-cli-model-bridge`](https://github.com/zjp1997720/zhijian-skills/tree/main/skills/codex-cli-model-bridge). V2 adds zero-to-one installation, per-user services for macOS/Windows/Linux, API-key and OAuth provider onboarding, transactional rollback, a dependency-free Python transparent proxy, generic ProviderSpec support, and end-to-end Codex verification. V2.1 adds legacy/v2 compaction compatibility, cross-route checkpoint replay, and guarded service handoff. See [NOTICE](NOTICE).
 
 ## Architecture
 
 ```text
 Codex Desktop / CLI (model_provider = openai)
-  -> 127.0.0.1:8318 Authorization rewriter
+  -> 127.0.0.1:8318 Authorization + compaction compatibility proxy
   -> 127.0.0.1:8317 CLIProxyAPI
   -> native GPT plus explicitly configured third-party routes
 ```
@@ -68,13 +68,30 @@ python3 scripts/bridge.py verify \
   --shell --tool-sequence --multi-agent
 ```
 
-If a route cannot return Codex's dedicated `compaction` item, preview and enable the local fallback:
+## Context compaction and route switches
+
+In current Codex builds, `remote_compaction_v2=false` selects the retired `/responses/compact` endpoint; it does not mean local compaction. A cross-Provider or cross-route model switch may checkpoint immediately even when the thread is far below its context limit, while a same-route model switch may not.
+
+Audit and dry-run first:
 
 ```bash
-python3 scripts/bridge.py local-compaction
-python3 scripts/bridge.py local-compaction \
-  --expected-sha256 <approved-sha256> --apply
+python3 scripts/bridge.py compaction audit --models all
+python3 scripts/bridge.py compaction configure
 ```
+
+The dry-run reports the complete config diff, `config_sha256`, transaction ID, exact backup paths, and rollback command. Only after confirming that 8318 is healthy and receiving explicit user approval, reuse those guards:
+
+```bash
+python3 scripts/bridge.py compaction configure \
+  --expected-sha256 <approved-sha256> \
+  --transaction-id <approved-transaction-id> \
+  --apply
+python3 scripts/bridge.py compaction verify --models all
+```
+
+Native GPT v2 compaction passes through. Gemini, GLM, DeepSeek, and other routed targets summarize with that same current target model; 8318 wraps the result as exactly one replayable `ocx1:` compaction item. Request bodies support identity, gzip, deflate, and Python 3.14 zstd. Unknown encodings are forwarded unchanged to avoid a blanket 415, but that bypass is not considered synthetic-compaction proof; a real zstd compaction and replay probe is still required. Failure never silently sends third-party history to GPT. The legacy `local-compaction` command is now only a deprecated alias and never writes the unsafe `false` setting.
+
+See [Compaction and cross-route checkpoints](references/compaction.md) for the full protocol and rollout gates.
 
 ## Provider presets
 
@@ -108,7 +125,7 @@ python3 scripts/bridge.py credential login \
 
 ## Rollback
 
-Every V2 mutation records exact paths, hashes, private backups, and created services.
+Every V2 mutation records exact paths, hashes, private backups, and affected services. Compaction apply requires the SHA and transaction ID returned by an approved dry-run.
 
 ```bash
 python3 scripts/bridge.py rollback --transaction <id>
@@ -124,11 +141,12 @@ Rollback refuses files changed after the transaction unless the user explicitly 
 - Provider config backups may contain credentials and remain owner-only.
 - OAuth is completed by the account owner in the browser.
 - The Skill does not replace Codex Desktop `auth.json`, edit task rows, or overwrite unrelated Codex settings.
+- Never apply an 8318 service or root-config change in the same turn as its dry-run. If 8318 is already not listening, stop and ask the user instead of attempting recovery.
 
 ## Development
 
 ```bash
-python3 -m py_compile scripts/bridge.py scripts/deployment.py scripts/transparent_proxy.py
+python3 -m py_compile scripts/bridge.py scripts/deployment.py scripts/compaction.py scripts/transparent_proxy.py
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 

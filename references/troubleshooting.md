@@ -27,7 +27,11 @@
 - **Bare `sync` reports missing command-backed auth**: V2 defaults `sync` to the isolated `cli-proxy.config.toml`. For an older fork, pass that profile explicitly instead of reading the root Desktop `openai` Provider.
 - **Fast rejected**: remove `service_tier = "fast"` or use the default tier. Do not rename the model to imply Fast.
 - **Model claims to be another vendor**: self-description is not routing evidence. Correlate the requested slug, alias, chosen CLIProxyAPI Provider, upstream result, response model, and Codex rollout.
-- **Compaction returns ordinary assistant text**: mark remote compaction incompatible and use local compaction. Do not accept a normal message as a `compaction` output item.
+- **Automatic compaction calls `/v1/responses/compact` and returns 404/501**: `features.remote_compaction_v2=false` selected Codex's retired legacy remote endpoint; it did not enable local compaction. Run `compaction configure` as a dry-run, review the complete diff and transaction, obtain explicit approval, and enable v2 through the 8318 compatibility proxy. Fully restart Codex afterward.
+- **Changing models compacts immediately at low token usage**: compare the old and new route, not only their context-window sizes. Codex may checkpoint at a cross-route boundary so incompatible reasoning/encrypted state is not replayed directly. Same-route model changes may continue without compaction. Keep the boundary checkpoint and fix its v1/v2 transport; do not inflate catalog context limits or disable compaction.
+- **`compaction_trigger` returns ordinary reasoning/message output**: the target route lacks native v2 output. The 8318 adapter must summarize with that same target model and return exactly one replayable `ocx1:` compaction item. Do not accept ordinary assistant text as success and do not send the history to GPT without explicit user authorization.
+- **Switching back to native GPT fails on a prior reasoning item**: remove only the invalid third-party reasoning `content` field while preserving legal summary/encrypted state, then re-run compaction and replay probes. Do not rewrite rollout JSONL.
+- **macOS 8318 disappears during service reload**: `launchctl bootout` is asynchronous. Wait until `launchctl print gui/<uid>/<label>` no longer finds the old job before bootstrap; bound bootstrap retries and confirm the service is running plus `/v1/models` is 200. If 8318 is already absent before an approved change, stop and ask the user instead of attempting recovery.
 
 ## Rollback
 
@@ -45,4 +49,4 @@ On Windows, if `python3` is missing, retry with `py -3` or `python`. If `cliprox
 
 The bridge state file tracks ownership only. Removing it does not restore configuration; use the backups.
 
-V2 commands additionally record transactions under the private state directory. Preview `rollback --transaction <id>` before applying it. Rollback refuses later edits by default and stops only services recorded in that transaction.
+V2 commands additionally record transactions under the private state directory. Compaction service changes require the config SHA-256 and transaction ID returned by the approved dry-run. Their backup directory is reported before apply. Preview `rollback --transaction <id>` before applying it. Rollback refuses later edits by default; when the 8318 service existed before the transaction, rollback restores and restarts that previous definition rather than leaving the port down.

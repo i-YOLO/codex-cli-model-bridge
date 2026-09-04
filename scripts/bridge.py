@@ -526,6 +526,45 @@ def remove_top_scalar(text: str, key: str) -> str:
     return "".join(line for index, line in enumerate(lines) if not (index < first_table and pattern.match(line)))
 
 
+def replace_toml_table_bool(text: str, table: str, key: str, value: bool) -> str:
+    rendered = "true" if value else "false"
+    lines = text.splitlines(keepends=True)
+    table_pattern = re.compile(rf"^\s*\[{re.escape(table)}\]\s*$")
+    key_pattern = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    table_start = next(
+        (index for index, line in enumerate(lines) if table_pattern.match(line.rstrip("\r\n"))),
+        None,
+    )
+    if table_start is None:
+        prefix = text.rstrip() + ("\n\n" if text.strip() else "")
+        return prefix + f"[{table}]\n{key} = {rendered}\n"
+    table_end = next(
+        (index for index in range(table_start + 1, len(lines)) if lines[index].lstrip().startswith("[")),
+        len(lines),
+    )
+    for index in range(table_start + 1, table_end):
+        if key_pattern.match(lines[index]):
+            lines[index] = f"{key} = {rendered}\n"
+            return "".join(lines)
+    lines.insert(table_end, f"{key} = {rendered}\n")
+    return "".join(lines)
+
+
+def enable_remote_compaction_v2(text: str) -> str:
+    legacy_comment = (
+        "# Remote compaction v2 requires the model to return a dedicated compaction\n"
+        "# output item. GLM / Gemini / other third-party routes via CLIProxyAPI do not\n"
+        "# produce that item, so disable it and let Codex compact history locally.\n"
+    )
+    current_comment = (
+        "# Remote compaction v2 uses /responses with a compaction_trigger. The loopback\n"
+        "# bridge synthesizes a replayable item for third-party models; setting false\n"
+        "# selects the retired /responses/compact endpoint and breaks long tasks.\n"
+    )
+    updated = text.replace(legacy_comment, current_comment)
+    return replace_toml_table_bool(updated, "features", "remote_compaction_v2", True)
+
+
 def thread_inventory(path: Path) -> tuple[dict[str, int], dict[str, object] | None, str | None]:
     if not path.exists():
         return {}, None, "state database is missing"
@@ -851,7 +890,13 @@ def start_transparent_proxy(
             stderr=subprocess.DEVNULL,
             check=False,
         )
-        if reload_proc.returncode == 0 and enable_proc.returncode == 0:
+        restart_proc = subprocess.run(
+            ["systemctl", "--user", "restart", systemd_unit_path.name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if reload_proc.returncode == 0 and enable_proc.returncode == 0 and restart_proc.returncode == 0:
             return None
         return "systemd failed to start the transparent proxy"
     if is_windows() and shutil.which("schtasks"):
@@ -900,14 +945,42 @@ def start_launch_agent(path: Path) -> str | None:
         stderr=subprocess.DEVNULL,
         check=False,
     ).returncode == 0
-    command = ["/bin/launchctl", "kickstart", "-k", target] if loaded else [
-        "/bin/launchctl",
-        "bootstrap",
-        domain,
-        str(path),
-    ]
-    proc = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-    return None if proc.returncode == 0 else "launchctl failed to start the transparent proxy"
+    if loaded:
+        subprocess.run(
+            ["/bin/launchctl", "bootout", target],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        # bootout is asynchronous: bootstrap races the teardown unless we wait
+        # until launchd reports the job as removed from the domain.
+        for _ in range(20):
+            if (
+                subprocess.run(
+                    ["/bin/launchctl", "print", target],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                ).returncode
+                != 0
+            ):
+                break
+            time.sleep(0.5)
+        else:
+            return "launchctl failed to unload the previous transparent proxy"
+    for _ in range(3):
+        proc = subprocess.run(
+            ["/bin/launchctl", "bootstrap", domain, str(path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if proc.returncode == 0:
+            break
+        time.sleep(1.0)
+    else:
+        return "launchctl failed to start the transparent proxy"
+    return None
 
 
 def restart_cliproxyapi(brew: Path) -> str | None:
@@ -1158,6 +1231,7 @@ def cmd_configure_desktop(args: argparse.Namespace) -> None:
     updated = replace_top_scalar(current, "model_provider", "openai")
     updated = replace_top_scalar(updated, "openai_base_url", args.transparent_url)
     updated = replace_top_scalar(updated, "model_catalog_json", str(catalog_path))
+    updated = enable_remote_compaction_v2(updated)
     if args.default_model:
         updated = replace_top_scalar(updated, "model", args.default_model)
     diff = config_diff(config_path, current, updated)
@@ -1175,6 +1249,7 @@ def cmd_configure_desktop(args: argparse.Namespace) -> None:
         "transparent_url": args.transparent_url,
         "authenticated_upstream": args.proxy_url,
         "runtime_script": str(runtime_path),
+        "compaction_runtime": str(runtime_path.with_name("compaction.py")),
         "launch_agent": str(launch_agent_path),
         "backup": None,
         "secrets_redacted": True,
@@ -1183,8 +1258,10 @@ def cmd_configure_desktop(args: argparse.Namespace) -> None:
         emit(result)
 
     runtime_source = (SKILL_DIR / "scripts" / "transparent_proxy.py").read_text(encoding="utf-8")
+    compaction_source = (SKILL_DIR / "scripts" / "compaction.py").read_text(encoding="utf-8")
     runtime_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     atomic_write(runtime_path, runtime_source, 0o700)
+    atomic_write(runtime_path.with_name("compaction.py"), compaction_source, 0o600)
     launch_error = start_transparent_proxy(
         runtime_path,
         helper_path,
@@ -1207,6 +1284,7 @@ def cmd_configure_desktop(args: argparse.Namespace) -> None:
         or verified.get("model_provider", "openai") != "openai"
         or verified.get("openai_base_url") != args.transparent_url
         or verified.get("model_catalog_json") != str(catalog_path)
+        or verified.get("features", {}).get("remote_compaction_v2") is not True
     ):
         emit({"status": "blocked", "error": "post-write config verification failed"}, 2)
     _, inventory_after, after_error = thread_inventory(state_db)
@@ -1228,6 +1306,7 @@ def cmd_audit(args: argparse.Namespace) -> None:
     transparent_mode = (
         default_provider == "openai" and isinstance(root_base_url, str) and bool(root_base_url)
     )
+    remote_compaction_v2 = config.get("features", {}).get("remote_compaction_v2")
     provider = provider_from_config(profile)
     base_url = root_base_url if transparent_mode else provider.get("base_url")
     base_url = base_url if isinstance(base_url, str) else None
@@ -1256,6 +1335,10 @@ def cmd_audit(args: argparse.Namespace) -> None:
         findings.append(f"{profile_path.name} is not mode 0600")
     if history_provider and default_provider != history_provider:
         findings.append("default Provider hides the majority of indexed thread history")
+    if transparent_mode and remote_compaction_v2 is False:
+        findings.append(
+            "remote_compaction_v2=false selects the retired /responses/compact endpoint"
+        )
     if transparent_mode:
         if auth_error or auth.get("mode") != "chatgpt" or not auth.get("chatgpt_tokens_present"):
             findings.append("desktop-transparent mode is missing a healthy ChatGPT login")
@@ -1326,6 +1409,7 @@ def cmd_audit(args: argparse.Namespace) -> None:
                 "bridge_mode": "desktop-transparent" if transparent_mode else "isolated-profile",
                 "openai_base_url": root_base_url if transparent_mode else None,
                 "service_tier": config.get("service_tier"),
+                "remote_compaction_v2": remote_compaction_v2,
             },
             "auth": auth,
             "history": {
@@ -1970,7 +2054,7 @@ def parser() -> argparse.ArgumentParser:
     desktop.add_argument("--systemd-unit", default=str(DEFAULT_SYSTEMD_UNIT))
     desktop.add_argument("--windows-task-name", default=DEFAULT_WINDOWS_TASK)
     desktop.add_argument("--node", default=str(default_node()), help=argparse.SUPPRESS)
-    desktop.add_argument("--default-model", default="gpt-5.6-sol")
+    desktop.add_argument("--default-model")
     desktop.add_argument("--expected-sha256")
     desktop.add_argument("--apply", action="store_true")
     desktop.set_defaults(func=cmd_configure_desktop)

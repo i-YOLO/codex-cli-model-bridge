@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "bridge.py"
@@ -53,6 +54,60 @@ def native_template() -> dict:
 
 
 class BridgeTests(unittest.TestCase):
+    def load_bridge_module(self):
+        module_spec = __import__("importlib.util").util.spec_from_file_location("bridge_under_test", SCRIPT)
+        module = __import__("importlib.util").util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+        return module
+
+    def test_start_launch_agent_waits_for_async_bootout_and_retries_bootstrap(self) -> None:
+        bridge = self.load_bridge_module()
+        results = [
+            subprocess.CompletedProcess([], 0),  # existing job is loaded
+            subprocess.CompletedProcess([], 0),  # bootout accepted
+            subprocess.CompletedProcess([], 0),  # still unloading
+            subprocess.CompletedProcess([], 1),  # removed from the domain
+            subprocess.CompletedProcess([], 5),  # first bootstrap collision
+            subprocess.CompletedProcess([], 0),  # retry succeeds
+        ]
+        with mock.patch.object(bridge.subprocess, "run", side_effect=results) as run, mock.patch.object(
+            bridge.time, "sleep"
+        ) as sleep:
+            error = bridge.start_launch_agent(Path("/tmp/bridge.plist"))
+        self.assertIsNone(error)
+        bootstrap_calls = [
+            call for call in run.call_args_list if len(call.args[0]) > 1 and call.args[0][1] == "bootstrap"
+        ]
+        self.assertEqual(len(bootstrap_calls), 2)
+        self.assertEqual(sleep.call_args_list, [mock.call(0.5), mock.call(1.0)])
+
+    def test_start_launch_agent_stops_when_old_job_never_disappears(self) -> None:
+        bridge = self.load_bridge_module()
+        results = [
+            subprocess.CompletedProcess([], 0),
+            subprocess.CompletedProcess([], 0),
+            *[subprocess.CompletedProcess([], 0) for _ in range(20)],
+        ]
+        with mock.patch.object(bridge.subprocess, "run", side_effect=results) as run, mock.patch.object(
+            bridge.time, "sleep"
+        ):
+            error = bridge.start_launch_agent(Path("/tmp/bridge.plist"))
+        self.assertEqual(error, "launchctl failed to unload the previous transparent proxy")
+        self.assertFalse(
+            any(len(call.args[0]) > 1 and call.args[0][1] == "bootstrap" for call in run.call_args_list)
+        )
+
+    def test_start_launch_agent_bootstraps_directly_when_not_loaded(self) -> None:
+        bridge = self.load_bridge_module()
+        results = [subprocess.CompletedProcess([], 1), subprocess.CompletedProcess([], 0)]
+        with mock.patch.object(bridge.subprocess, "run", side_effect=results) as run, mock.patch.object(
+            bridge.time, "sleep"
+        ) as sleep:
+            error = bridge.start_launch_agent(Path("/tmp/bridge.plist"))
+        self.assertIsNone(error)
+        self.assertEqual(run.call_args_list[1].args[0][1], "bootstrap")
+        sleep.assert_not_called()
+
     def test_bundled_manifests_validate(self) -> None:
         for manifest in sorted((SCRIPT.parents[1] / "models").glob("*.json")):
             proc = run_bridge("validate-manifest", str(manifest))
@@ -598,6 +653,8 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(payload["status"], "planned")
             self.assertIn('model_provider = "openai"', payload["diff"])
             self.assertIn('openai_base_url = "http://127.0.0.1:8318/v1"', payload["diff"])
+            self.assertIn("remote_compaction_v2 = true", payload["diff"])
+            self.assertNotIn('-model = "gpt-5.6-sol"', payload["diff"])
             self.assertFalse(runtime.exists())
             self.assertFalse(launch_agent.exists())
 

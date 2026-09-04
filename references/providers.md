@@ -31,7 +31,7 @@ Required top-level fields are `schema_version`, `id`, `adapter`, `auth_mode`, `b
 
 Known bundled slugs inherit their maintained manifest. Each unknown model must additionally declare display name, description, native template, context window, effective percentage, default and supported reasoning levels, modalities, and priority. Add transport overrides only with evidence.
 
-The generated manifest is metadata, not proof. Require `/v1/models`, text, real Shell, multi-tool, Multi-Agent when claimed, image when claimed, and compaction/fallback validation.
+The generated manifest is metadata, not proof. Require `/v1/models`, text, real Shell, multi-tool, Multi-Agent when claimed, image when claimed, and both compaction plus replay validation. Cross-route switching may request a checkpoint even at low token usage; the target model must pass the 8318 v2 adapter rather than relying on `remote_compaction_v2=false`.
 
 Multi-Agent validation must assert that the model returns the exact marker embedded in the delegated task. A 200 response with “no task received” is a failure. Do not describe the duration of this private protocol probe as normal model response speed.
 

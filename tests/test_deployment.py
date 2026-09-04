@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import gzip
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zlib
 from unittest import mock
 
 
@@ -24,6 +26,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 import deployment  # noqa: E402
+import compaction  # noqa: E402
 
 
 class DeploymentUnitTests(unittest.TestCase):
@@ -86,6 +89,101 @@ class DeploymentUnitTests(unittest.TestCase):
             deployment.finish_transaction(state, tx)
             deployment.restore_transaction(tx)
             self.assertFalse(target.exists())
+
+    def test_transaction_id_rejects_path_traversal(self) -> None:
+        with self.assertRaises(deployment.DeploymentError):
+            deployment.transaction_dir(Path("/tmp/state"), "../escape")
+        with self.assertRaises(deployment.DeploymentError):
+            deployment.transaction_dir(Path("/tmp/state"), "/absolute")
+        self.assertEqual(
+            deployment.transaction_dir(Path("/tmp/state"), "approved-transaction"),
+            Path("/tmp/state/transactions/approved-transaction"),
+        )
+
+    def test_failed_transaction_records_completed_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            target = root / "config.toml"
+            target.write_text("before", encoding="utf-8")
+            transaction_id, tx = deployment.begin_transaction(
+                root / "state", "compaction-configure", [target], "approved-transaction"
+            )
+            target.write_text("candidate", encoding="utf-8")
+            deployment.restore_transaction(tx, require_after_match=False)
+            deployment.fail_transaction(
+                root / "state",
+                tx,
+                "candidate failed",
+                rollback_completed=True,
+                service_restore=None,
+            )
+            recorded = deployment.read_json(
+                deployment.transaction_dir(root / "state", transaction_id) / "transaction.json"
+            )
+            self.assertEqual(recorded["status"], "failed")
+            self.assertTrue(recorded["failure"]["rollback_completed"])
+            self.assertEqual(target.read_text(encoding="utf-8"), "before")
+
+    def test_restore_recorded_services_only_restarts_marked_entries(self) -> None:
+        payload = {
+            "services": [
+                {"identifier": "created-only", "restart_after_restore": False},
+                {
+                    "identifier": "bridge",
+                    "definition_path": "/tmp/bridge.plist",
+                    "restart_after_restore": True,
+                },
+            ]
+        }
+        with mock.patch.object(deployment, "restore_transparent_service", return_value=None) as restore:
+            self.assertEqual(deployment.restore_recorded_services(payload), [])
+        restore.assert_called_once_with(
+            Path("/tmp/bridge.plist"), "CodexCliModelBridgeTransparentProxy"
+        )
+
+    def test_compaction_apply_requires_approved_sha_and_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            config = Path(raw) / "config.toml"
+            config.write_text('[features]\nremote_compaction_v2 = false\n', encoding="utf-8")
+            missing_sha = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "bridge.py"),
+                    "compaction",
+                    "configure",
+                    "--config",
+                    str(config),
+                    "--transaction-id",
+                    "approved-transaction",
+                    "--apply",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(missing_sha.returncode, 2)
+            self.assertIn("requires the config SHA-256", missing_sha.stdout)
+            sha = deployment.sha256_path(config)
+            missing_transaction = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPTS / "bridge.py"),
+                    "compaction",
+                    "configure",
+                    "--config",
+                    str(config),
+                    "--expected-sha256",
+                    str(sha),
+                    "--apply",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(missing_transaction.returncode, 2)
+            self.assertIn("requires the transaction id", missing_transaction.stdout)
 
     def test_checksum_lookup(self) -> None:
         payload = b"a" * 64 + b"  archive.tar.gz\n"
@@ -281,47 +379,29 @@ class DeploymentUnitTests(unittest.TestCase):
         self.assertIn(b"IHDR", png)
         self.assertTrue(png.endswith(b"IEND\xaeB`\x82"))
 
-    def test_local_compaction_preview_apply_and_rollback(self) -> None:
-        with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
-            state = root / "state"
-            config = root / "config.toml"
-            config.write_text('model = "gpt-test"\n\n[features]\nremote_compaction_v2 = true\n', encoding="utf-8")
-            preview = subprocess.run(
-                [sys.executable, str(SCRIPTS / "bridge.py"), "local-compaction", "--config", str(config), "--state-dir", str(state)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(preview.returncode, 0, preview.stderr)
-            planned = json.loads(preview.stdout)
-            self.assertTrue(planned["changed"])
-            applied = subprocess.run(
-                [
-                    sys.executable,
-                    str(SCRIPTS / "bridge.py"),
-                    "local-compaction",
-                    "--config",
-                    str(config),
-                    "--state-dir",
-                    str(state),
-                    "--expected-sha256",
-                    planned["config_sha256"],
-                    "--apply",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
-            )
-            self.assertEqual(applied.returncode, 0, applied.stderr)
-            payload = json.loads(applied.stdout)
-            self.assertIn("remote_compaction_v2 = false", config.read_text())
-            deployment.restore_transaction(
-                deployment.read_json(deployment.transaction_dir(state, payload["transaction"]) / "transaction.json")
-            )
-            self.assertIn("remote_compaction_v2 = true", config.read_text())
+    def test_local_compaction_is_deprecated_configure_alias(self) -> None:
+        args = deployment.argparse.Namespace(
+            config="/tmp/config.toml",
+            state_dir="/tmp/bridge-state",
+            expected_sha256="approved",
+            transaction_id="approved-transaction",
+            apply=True,
+        )
+        with mock.patch.object(deployment, "cmd_compaction_configure") as configure:
+            deployment.cmd_local_compaction(args)
+        forwarded = configure.call_args.args[0]
+        self.assertTrue(forwarded.deprecated_alias)
+        self.assertTrue(forwarded.apply)
+        self.assertEqual(forwarded.expected_sha256, "approved")
+        self.assertEqual(forwarded.transaction_id, "approved-transaction")
+        self.assertEqual(forwarded.proxy_url, deployment.DEFAULT_TRANSPARENT_URL)
+        self.assertEqual(forwarded.upstream_url, deployment.DEFAULT_PROXY_URL)
+
+    def test_compaction_setting_only_moves_to_true(self) -> None:
+        original = '[features]\nremote_compaction_v2 = false\n'
+        updated = deployment.set_toml_table_bool(original, "features", "remote_compaction_v2", True)
+        self.assertIn("remote_compaction_v2 = true", updated)
+        self.assertNotIn("remote_compaction_v2 = false", updated)
 
     def test_sync_defaults_to_fallback_profile(self) -> None:
         sys.path.insert(0, str(SCRIPTS))
@@ -355,17 +435,54 @@ class CaptureHandler(socketserver.BaseRequestHandler):
         data = bytearray()
         while b"\r\n\r\n" not in data:
             data.extend(self.request.recv(4096))
-        self.server.captured = bytes(data)  # type: ignore[attr-defined]
-        if b"upgrade: websocket" in bytes(data).lower():
+        marker = data.index(b"\r\n\r\n") + 4
+        header = bytes(data[:marker])
+        body = bytearray(data[marker:])
+        length = 0
+        for line in header.decode("iso-8859-1").split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                length = int(line.split(":", 1)[1].strip())
+        while len(body) < length:
+            body.extend(self.request.recv(length - len(body)))
+        captured = header + bytes(body[:length])
+        self.server.captured = captured  # type: ignore[attr-defined]
+        self.server.captured_requests.append(captured)  # type: ignore[attr-defined]
+        if b"upgrade: websocket" in header.lower():
             self.request.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
             payload = self.request.recv(4)
             self.request.sendall(payload)
         else:
-            body = b"data: ok\n\n"
+            text = bytes(body[:length]).decode("utf-8", errors="replace") or "mock-normal-response"
+            try:
+                request_payload = json.loads(text)
+            except json.JSONDecodeError:
+                request_payload = {}
+            if request_payload.get("model") in self.server.fail_models:  # type: ignore[attr-defined]
+                error_body = b'{"error":"forced"}'
+                self.request.sendall(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(error_body)}\r\nConnection: close\r\n\r\n".encode()
+                    + error_body
+                )
+                return
+            response_payload = {
+                "id": "resp_mock",
+                "object": "response",
+                "status": "completed",
+                "model": "mock",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": text}],
+                    }
+                ],
+            }
+            response_body = json.dumps(response_payload).encode()
             self.request.sendall(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
-                + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
-                + body
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(response_body)}\r\nConnection: close\r\n\r\n".encode()
+                + response_body
             )
 
 
@@ -373,6 +490,8 @@ class TransparentProxyIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.upstream = socketserver.ThreadingTCPServer(("127.0.0.1", 0), CaptureHandler)
         self.upstream.daemon_threads = True
+        self.upstream.captured_requests = []  # type: ignore[attr-defined]
+        self.upstream.fail_models = set()  # type: ignore[attr-defined]
         self.thread = threading.Thread(target=self.upstream.serve_forever, daemon=True)
         self.thread.start()
         probe = socket.socket()
@@ -415,10 +534,14 @@ class TransparentProxyIntegrationTests(unittest.TestCase):
         self.upstream.server_close()
         self.temp.cleanup()
 
-    def test_http_sse_rewrites_authorization(self) -> None:
-        with socket.create_connection(("127.0.0.1", self.proxy_port), timeout=2) as client:
+    def request(self, path: str, payload: dict, extra_headers: bytes = b"") -> bytes:
+        body = json.dumps(payload, separators=(",", ":")).encode()
+        with socket.create_connection(("127.0.0.1", self.proxy_port), timeout=5) as client:
             client.sendall(
-                b"POST /v1/responses HTTP/1.1\r\nHost: old\r\nAuthorization: Bearer desktop-token\r\nContent-Length: 0\r\n\r\n"
+                f"POST {path} HTTP/1.1\r\nHost: old\r\nAuthorization: Bearer desktop-token\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\n".encode()
+                + extra_headers
+                + b"\r\n"
+                + body
             )
             response = bytearray()
             while True:
@@ -426,9 +549,191 @@ class TransparentProxyIntegrationTests(unittest.TestCase):
                 if not chunk:
                     break
                 response.extend(chunk)
-        self.assertIn(b"data: ok", response)
+        return bytes(response)
+
+    def test_http_sse_rewrites_authorization(self) -> None:
+        payload = {
+            "model": "gemini-test",
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ordinary"}]}],
+            "stream": False,
+        }
+        response = self.request("/v1/responses", payload)
+        self.assertIn(b"200 OK", response)
         self.assertIn(b"Authorization: Bearer local-client-key", self.upstream.captured)  # type: ignore[attr-defined]
         self.assertNotIn(b"desktop-token", self.upstream.captured)  # type: ignore[attr-defined]
+        captured_body = self.upstream.captured.split(b"\r\n\r\n", 1)[1]  # type: ignore[attr-defined]
+        self.assertEqual(captured_body, json.dumps(payload, separators=(",", ":")).encode())
+
+    def test_synthetic_v2_and_replay(self) -> None:
+        marker = "synthetic-replay-marker"
+        response = self.request(
+            "/v1/responses",
+            {
+                "model": "glm-test",
+                "input": [
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": marker}]},
+                    {"type": "compaction_trigger"},
+                ],
+                "stream": True,
+            },
+        )
+        self.assertIn(b"response.output_item.added", response)
+        self.assertIn(b"response.output_item.done", response)
+        self.assertIn(b"ocx1:", response)
+        body = response.split(b"\r\n\r\n", 1)[1]
+        events = deployment._parse_sse(body)
+        completed = [event for event in events if event.get("type") == "response.completed"][0]
+        item = completed["response"]["output"][0]
+        self.assertEqual(item["type"], "compaction")
+        summary_request = self.upstream.captured_requests[-1].split(b"\r\n\r\n", 1)[1]  # type: ignore[attr-defined]
+        summary_payload = json.loads(summary_request)
+        self.assertEqual(summary_payload["model"], "glm-test")
+        self.assertNotIn("tools", summary_payload)
+
+        replay = self.request(
+            "/v1/responses",
+            {
+                "model": "glm-test",
+                "input": [
+                    item,
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+                ],
+                "stream": False,
+            },
+        )
+        self.assertIn(b"200 OK", replay)
+        captured = self.upstream.captured_requests[-1].split(b"\r\n\r\n", 1)[1]  # type: ignore[attr-defined]
+        forwarded = json.loads(captured)
+        self.assertEqual(forwarded["input"][0]["type"], "message")
+        self.assertNotIn("ocx1:", json.dumps(forwarded))
+        self.assertIn(marker, json.dumps(forwarded))
+
+    def test_legacy_v1_returns_replacement_history(self) -> None:
+        marker = "legacy-v1-marker"
+        response = self.request(
+            "/v1/responses/compact",
+            {
+                "model": "gemini-test",
+                "input": [
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": marker}]}
+                ],
+                "stream": False,
+            },
+        )
+        payload = json.loads(response.split(b"\r\n\r\n", 1)[1])
+        self.assertGreaterEqual(len(payload["output"]), 2)
+        self.assertIn(marker, json.dumps(payload, ensure_ascii=False))
+
+    def test_cross_route_compaction_failure_never_falls_back_to_gpt(self) -> None:
+        self.upstream.fail_models.add("cross-route-target")  # type: ignore[attr-defined]
+        response = self.request(
+            "/v1/responses",
+            {
+                "model": "cross-route-target",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "prior route result"}],
+                    },
+                    {"type": "compaction_trigger"},
+                ],
+                "stream": True,
+            },
+        )
+        self.assertIn(b"response.failed", response)
+        models = []
+        for captured in self.upstream.captured_requests:  # type: ignore[attr-defined]
+            payload = json.loads(captured.split(b"\r\n\r\n", 1)[1])
+            models.append(payload.get("model"))
+        self.assertEqual(models, ["cross-route-target"] * 3)
+        self.assertNotIn("gpt-5.6-sol", models)
+
+    def test_native_reasoning_content_is_removed_before_forward(self) -> None:
+        response = self.request(
+            "/v1/responses",
+            {
+                "model": "gpt-test",
+                "input": [
+                    {"type": "reasoning", "content": [1, 2], "summary": [{"type": "summary_text", "text": "keep"}]},
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+                ],
+                "stream": False,
+            },
+        )
+        self.assertIn(b"200 OK", response)
+        captured = self.upstream.captured_requests[-1].split(b"\r\n\r\n", 1)[1]  # type: ignore[attr-defined]
+        forwarded = json.loads(captured)
+        self.assertNotIn("content", forwarded["input"][0])
+        self.assertEqual(forwarded["input"][0]["summary"][0]["text"], "keep")
+
+    def test_replay_supports_gzip_and_deflate_and_updates_length(self) -> None:
+        for encoding in ("gzip", "deflate"):
+            with self.subTest(encoding=encoding):
+                payload = {
+                    "model": "glm-test",
+                    "input": [
+                        {
+                            "type": "compaction",
+                            "encrypted_content": compaction.encode_compaction_summary(f"{encoding}-marker"),
+                        }
+                    ],
+                    "stream": False,
+                }
+                source = json.dumps(payload, separators=(",", ":")).encode()
+                body = gzip.compress(source) if encoding == "gzip" else zlib.compress(source)
+                with socket.create_connection(("127.0.0.1", self.proxy_port), timeout=5) as client:
+                    client.sendall(
+                        f"POST /v1/responses HTTP/1.1\r\nHost: old\r\nContent-Type: application/json\r\nContent-Encoding: {encoding}\r\nContent-Length: {len(body)}\r\n\r\n".encode()
+                        + body
+                    )
+                    while client.recv(4096):
+                        pass
+                captured = self.upstream.captured_requests[-1]  # type: ignore[attr-defined]
+                header, compressed = captured.split(b"\r\n\r\n", 1)
+                expected_length = next(
+                    int(line.split(b":", 1)[1].strip())
+                    for line in header.split(b"\r\n")
+                    if line.lower().startswith(b"content-length:")
+                )
+                self.assertEqual(expected_length, len(compressed))
+                decoded = gzip.decompress(compressed) if encoding == "gzip" else zlib.decompress(compressed)
+                forwarded = json.loads(decoded)
+                self.assertEqual(forwarded["input"][0]["type"], "message")
+                self.assertIn(f"{encoding}-marker", json.dumps(forwarded))
+
+    def test_compaction_tunnels_unsupported_content_encoding(self) -> None:
+        body = b"not-brotli"
+        with socket.create_connection(("127.0.0.1", self.proxy_port), timeout=5) as client:
+            client.sendall(
+                f"POST /v1/responses/compact HTTP/1.1\r\nHost: old\r\nContent-Type: application/json\r\nContent-Encoding: br\r\nContent-Length: {len(body)}\r\n\r\n".encode()
+                + body
+            )
+            response = bytearray()
+            while True:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                response.extend(chunk)
+        self.assertNotIn(b"415 Unsupported Media Type", response)
+        self.assertIn(b"200 OK", response)
+        captured = self.upstream.captured_requests[-1]  # type: ignore[attr-defined]
+        header, forwarded = captured.split(b"\r\n\r\n", 1)
+        self.assertIn(b"content-encoding: br", header.lower())
+        self.assertEqual(forwarded, body)
+
+    def test_health_reports_compaction_protocol_without_payloads(self) -> None:
+        with socket.create_connection(("127.0.0.1", self.proxy_port), timeout=2) as client:
+            client.sendall(b"GET /__codex_bridge_health HTTP/1.1\r\nHost: old\r\n\r\n")
+            response = bytearray()
+            while True:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                response.extend(chunk)
+        payload = json.loads(bytes(response).split(b"\r\n\r\n", 1)[1])
+        self.assertEqual(payload["compaction"]["protocol_version"], "2")
+        self.assertNotIn("synthetic-replay-marker", json.dumps(payload))
 
     def test_websocket_upgrade_is_tunneled(self) -> None:
         with socket.create_connection(("127.0.0.1", self.proxy_port), timeout=2) as client:

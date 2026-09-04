@@ -1,10 +1,10 @@
-# Codex CLI Model Bridge V2
+# Codex CLI Model Bridge V2.1
 
 在保留 Codex ChatGPT 登录和既有任务历史的前提下，把经过真实验收的 Gemini、DeepSeek、GLM、Grok 或自定义兼容模型接入 Codex CLI 与 Codex Desktop 原生模型选择器。
 
 正式仓库：[i-YOLO/codex-cli-model-bridge](https://github.com/i-YOLO/codex-cli-model-bridge)
 
-本项目基于 [Zhijian AI 的 MIT `codex-cli-model-bridge`](https://github.com/zjp1997720/zhijian-skills/tree/main/skills/codex-cli-model-bridge) 升级。V2 新增从零安装、三端用户级常驻、API Key/OAuth Provider、事务回滚、Python 透明代理、通用 ProviderSpec 和完整部署验收。详见 [NOTICE](NOTICE)。
+本项目基于 [Zhijian AI 的 MIT `codex-cli-model-bridge`](https://github.com/zjp1997720/zhijian-skills/tree/main/skills/codex-cli-model-bridge) 升级。V2 新增从零安装、三端用户级常驻、API Key/OAuth Provider、事务回滚、Python 透明代理、通用 ProviderSpec 和完整部署验收；V2.1 补齐旧／新双协议上下文压缩、跨路由切换回放和安全服务切换。详见 [NOTICE](NOTICE)。
 
 ## 能做什么
 
@@ -24,7 +24,7 @@ Codex Desktop / CLI
   model_provider = openai
           │
           ▼
-127.0.0.1:8318  仅改写本机 Authorization
+127.0.0.1:8318  本机 Authorization + 双协议压缩适配
           │
           ▼
 127.0.0.1:8317  CLIProxyAPI
@@ -96,13 +96,30 @@ python3 scripts/bridge.py verify \
   --shell --tool-sequence --multi-agent
 ```
 
-如果报告某个模型不能返回 Codex 专用 `compaction` item，先预览再启用本地压缩：
+## 上下文压缩与跨路由切换
+
+当前 Codex 中，`remote_compaction_v2=false` 会选择已退役的 `/responses/compact`，并不代表“本地压缩”。跨 Provider／路由切换还可能在远低于上下文上限时立即做一次兼容性压缩；同一路由内换模型则可能不触发。
+
+先审计，再 dry-run：
 
 ```bash
-python3 scripts/bridge.py local-compaction
-python3 scripts/bridge.py local-compaction \
-  --expected-sha256 <预览返回的哈希> --apply
+python3 scripts/bridge.py compaction audit --models all
+python3 scripts/bridge.py compaction configure
 ```
+
+dry-run 会返回完整配置 diff、`config_sha256`、事务 ID、精确备份路径和回滚命令。确认 8318 当前健康并由用户明确批准后，才使用同一组保护值执行：
+
+```bash
+python3 scripts/bridge.py compaction configure \
+  --expected-sha256 <已批准的哈希> \
+  --transaction-id <已批准的事务ID> \
+  --apply
+python3 scripts/bridge.py compaction verify --models all
+```
+
+原生 GPT 的 v2 压缩保持透传。Gemini、GLM、DeepSeek 等路由由当前目标模型自己生成摘要，8318 将其封装为唯一 `ocx1:` compaction item，并在下一轮解码回放；失败不会偷偷把第三方历史发送给 GPT。请求体支持 identity、gzip、deflate 和 Python 3.14 的 zstd；无法识别的编码会原样透传，避免让普通 Codex 请求统一报 415，但仍须通过真实 zstd 压缩／回放探针才算兼容。旧 `local-compaction` 只保留为兼容别名，不会再写入危险的 `false`。
+
+完整协议、跨路由触发依据和安全上线闸门见 [上下文压缩说明](references/compaction.md)。
 
 ## Gemini
 
@@ -145,7 +162,9 @@ python3 scripts/bridge.py provider add --spec /absolute/path/provider.json
 | 能聊天但 Shell 不执行 | 查 `tool_mode` 与真实 rollout | 不接受模型口头模拟命令 |
 | Subagent 422 `ModelInput` | 检查 `agent_message` 转换 | 不在 8318 重写全部协议 |
 | Subagent 返回 200 但没收到任务 | 检查严格 marker；必要时显式改用 Chat 兼容预设 | 不把 200 或耗时当多 Agent 通过 |
-| 长对话压缩失败 | 检查是否返回 `compaction` item | 不把普通 assistant 摘要当压缩成功 |
+| 压缩请求 `/responses/compact` 返回 404/501 | 检查 `remote_compaction_v2` 与 8318 协议版本 | 不把 `false` 当本地压缩 |
+| 跨路由换模型后立即压缩 | 这是路由边界 checkpoint；验证 v2 与回放 marker | 不伪造更大的 context window，也不关闭压缩 |
+| `compaction_trigger` 只返回普通 message | 启用同模型 `ocx1:` 适配并要求唯一 compaction item | 不把普通 assistant 摘要当压缩成功 |
 | 历史“消失” | 对比根 Provider 与任务 Provider 分布 | 不修改 SQLite 任务行 |
 
 回滚任何 V2 事务：
@@ -162,11 +181,12 @@ python3 scripts/bridge.py rollback --transaction <id> --apply
 - 事务备份可能包含原代理配置，因此同样按私有凭据文件保护。
 - OAuth 必须由账号所有者在浏览器完成；不要收集一次性 code。
 - 不改 Codex Desktop `auth.json`，不直接修改任务数据库，不覆盖无关 MCP、Hooks、Skills 或信任配置。
+- 8318 服务或根配置的 apply 不得与 dry-run 同轮执行；必须复用用户批准的哈希和事务 ID。若变更前 8318 已无监听，立即停止，不自行修复。
 
 ## 开发与验证
 
 ```bash
-python3 -m py_compile scripts/bridge.py scripts/deployment.py scripts/transparent_proxy.py
+python3 -m py_compile scripts/bridge.py scripts/deployment.py scripts/compaction.py scripts/transparent_proxy.py
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 

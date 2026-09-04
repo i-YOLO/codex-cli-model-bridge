@@ -34,12 +34,22 @@
     {
       "id": 7,
       "prompt": "模型能聊天但不会执行 shell，而且长对话压缩也报错。",
-      "expected_output": "Checks model-scoped tool transport metadata and real command events, separately probes compaction output types, and previews the local-compaction fallback without changing unrelated models."
+      "expected_output": "Checks model-scoped tool transport metadata and real command events, separately audits legacy and v2 compaction plus replay, and dry-runs the guarded 8318 adapter without treating remote_compaction_v2=false as local compaction."
     },
     {
       "id": 8,
       "prompt": "把刚才的多模型配置全部撤回。",
       "expected_output": "Previews the exact transaction rollback, refuses files changed afterward, stops only services created by that transaction, and preserves unrelated credentials and task history."
+    },
+    {
+      "id": 9,
+      "prompt": "为什么我从 DeepSeek 换到 GLM 或 Gemini 后，明明上下文还很短也会自动压缩并报 /responses/compact 404？",
+      "expected_output": "Compares route boundaries and real token/context metadata, recognizes cross-route checkpointing rather than a small context window, identifies remote_compaction_v2=false as the retired legacy endpoint, and fixes the v2/replay path instead of disabling compaction or inflating context metadata."
+    },
+    {
+      "id": 10,
+      "prompt": "修复 8318 压缩代理，但不能再把正在运行的 LaunchAgent 弄掉。",
+      "expected_output": "Checks that 8318 is already listening, completes offline tests, produces a dry-run with the exact diff, SHA, transaction, backups, apply and rollback commands, waits for explicit approval, and uses bounded asynchronous bootout/bootstrap handling with previous-service restoration on failure."
     }
   ]
 }

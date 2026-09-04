@@ -9,6 +9,7 @@ mutation as a reversible transaction.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import getpass
 import hashlib
@@ -26,11 +27,18 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+
+from compaction import (
+    COMPACTION_ITEM_TYPES,
+    OCX_COMPACTION_PREFIX,
+    extract_output_text,
+)
 
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
@@ -361,12 +369,24 @@ def render_provider_entry(spec: dict, models: list[dict], secret: str) -> tuple[
     raise DeploymentError("OAuth providers do not write API-key configuration")
 
 
+def validate_transaction_id(transaction_id: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", transaction_id):
+        raise DeploymentError("invalid transaction id")
+    return transaction_id
+
+
 def transaction_dir(state_dir: Path, transaction_id: str) -> Path:
+    validate_transaction_id(transaction_id)
     return state_dir / "transactions" / transaction_id
 
 
-def begin_transaction(state_dir: Path, kind: str, paths: list[Path]) -> tuple[str, dict]:
-    transaction_id = f"{timestamp()}-{kind}"
+def begin_transaction(
+    state_dir: Path,
+    kind: str,
+    paths: list[Path],
+    transaction_id: str | None = None,
+) -> tuple[str, dict]:
+    transaction_id = validate_transaction_id(transaction_id or f"{timestamp()}-{kind}")
     root = transaction_dir(state_dir, transaction_id)
     backup_dir = root / "before"
     backup_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -404,6 +424,28 @@ def finish_transaction(state_dir: Path, payload: dict) -> None:
     for item in payload["files"]:
         item["after_sha256"] = sha256_path(Path(item["path"]))
     payload["status"] = "applied"
+    atomic_write_text(
+        transaction_dir(state_dir, payload["id"]) / "transaction.json",
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    )
+
+
+def fail_transaction(
+    state_dir: Path,
+    payload: dict,
+    error: str,
+    rollback_completed: bool,
+    service_restore: str | None,
+) -> None:
+    for item in payload["files"]:
+        item["after_sha256"] = sha256_path(Path(item["path"]))
+    payload["status"] = "failed"
+    payload["failure"] = {
+        "error": error,
+        "rollback_completed": rollback_completed,
+        "service_restore": service_restore,
+        "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
     atomic_write_text(
         transaction_dir(state_dir, payload["id"]) / "transaction.json",
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -456,6 +498,114 @@ def stop_recorded_services(payload: dict) -> None:
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
+
+
+def restore_transparent_service(
+    service_path: Path,
+    windows_task_name: str,
+) -> str | None:
+    """Reload a restored service definition after an apply transaction fails."""
+
+    if platform.system() == "Darwin":
+        domain = f"gui/{os.getuid()}"
+        target = f"{domain}/com.zhijian.codex-cli-model-bridge-transparent-proxy"
+        loaded = subprocess.run(
+            ["launchctl", "print", target],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode == 0
+        if loaded:
+            stopped = subprocess.run(
+                ["launchctl", "bootout", target],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if stopped.returncode != 0:
+                return "launchctl could not unload the failed candidate during rollback"
+            for _ in range(20):
+                if subprocess.run(
+                    ["launchctl", "print", target],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                ).returncode != 0:
+                    break
+                time.sleep(0.5)
+            else:
+                return "launchctl did not finish rollback unload within 10 seconds"
+        for attempt in range(3):
+            started = subprocess.run(
+                ["launchctl", "bootstrap", domain, str(service_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if started.returncode == 0:
+                return None
+            if attempt < 2:
+                time.sleep(1.0)
+        return "launchctl could not restore the previous transparent proxy"
+    if platform.system() == "Linux":
+        reload_result = subprocess.run(
+            ["systemctl", "--user", "daemon-reload"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        restart_result = subprocess.run(
+            ["systemctl", "--user", "restart", service_path.name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return None if reload_result.returncode == 0 and restart_result.returncode == 0 else "systemd could not restore the previous transparent proxy"
+    if platform.system() == "Windows":
+        create = subprocess.run(
+            [
+                "schtasks",
+                "/Create",
+                "/F",
+                "/SC",
+                "ONLOGON",
+                "/RL",
+                "LIMITED",
+                "/TN",
+                windows_task_name,
+                "/TR",
+                subprocess.list2cmdline([str(service_path)]),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        result = subprocess.run(
+            ["schtasks", "/Run", "/TN", windows_task_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return None if create.returncode == 0 and result.returncode == 0 else "Task Scheduler could not restore the previous transparent proxy"
+    return "unsupported platform for automatic service rollback"
+
+
+def restore_recorded_services(payload: dict) -> list[str]:
+    errors: list[str] = []
+    for service in payload.get("services", []):
+        if not service.get("restart_after_restore"):
+            continue
+        definition = service.get("definition_path")
+        if not isinstance(definition, str) or not definition:
+            errors.append("transaction is missing the previous service definition path")
+            continue
+        error = restore_transparent_service(
+            Path(definition),
+            str(service.get("windows_task_name") or "CodexCliModelBridgeTransparentProxy"),
+        )
+        if error:
+            errors.append(error)
+    return errors
 
 
 def credential_path(state_dir: Path, provider_id: str) -> Path:
@@ -1007,7 +1157,9 @@ def cmd_activate(args: argparse.Namespace) -> None:
     else:
         service_path = None
         service_record = {"kind": "task-scheduler", "identifier": "CodexCliModelBridgeTransparentProxy"}
-    desktop_tracked = [root_config, runtime] + ([service_path] if service_path else [])
+    desktop_tracked = [root_config, runtime, runtime.with_name("compaction.py")] + (
+        [service_path] if service_path else []
+    )
     if platform.system() == "Windows":
         desktop_tracked.append(runtime.with_name("transparent_proxy.cmd"))
     plan = {
@@ -1154,33 +1306,278 @@ def proxy_token_from_config(path: Path) -> str:
     raise DeploymentError("CLIProxyAPI client key is missing")
 
 
+def _health_url(base_url: str) -> str:
+    parsed = urllib.parse.urlparse(base_url)
+    return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, "/__codex_bridge_health", "", "", ""))
+
+
+def _parse_sse(raw: bytes) -> list[dict]:
+    events: list[dict] = []
+    for line in raw.splitlines():
+        if not line.startswith(b"data:"):
+            continue
+        value = line[5:].strip()
+        if not value or value == b"[DONE]":
+            continue
+        try:
+            event = json.loads(value)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def _post_response(
+    base_url: str,
+    path: str,
+    payload: dict,
+    timeout: int,
+    token: str = "codex-bridge-probe",
+    attempts: int = 3,
+) -> dict:
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/{path.lstrip('/')}",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream" if payload.get("stream") is True else "application/json",
+            "Accept-Encoding": "identity",
+            "x-codex-beta-features": "remote_compaction_v2",
+        },
+        method="POST",
+    )
+    raw = b""
+    content_type = ""
+    status: int | None = None
+    attempt_count = 0
+    for attempt in range(max(1, attempts)):
+        attempt_count = attempt + 1
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read()
+                content_type = response.headers.get("Content-Type", "")
+                status = response.status
+            break
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            if exc.code not in {429, 500, 502, 503, 504} or attempt + 1 >= max(1, attempts):
+                return {"http_status": exc.code, "error": f"HTTP_{exc.code}", "attempts": attempt_count}
+        except (OSError, TimeoutError) as exc:
+            if attempt + 1 >= max(1, attempts):
+                return {"http_status": None, "error": type(exc).__name__, "attempts": attempt_count}
+        time.sleep(min(2.0, 0.25 * (2**attempt)))
+    if status is None:
+        return {"http_status": None, "error": "unavailable", "attempts": attempt_count}
+    if "text/event-stream" in content_type or payload.get("stream") is True:
+        events = _parse_sse(raw)
+        completed = next(
+            (
+                event.get("response")
+                for event in reversed(events)
+                if event.get("type") == "response.completed" and isinstance(event.get("response"), dict)
+            ),
+            None,
+        )
+        return {"http_status": status, "events": events, "response": completed, "attempts": attempt_count}
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"http_status": status, "error": "invalid_json", "attempts": attempt_count}
+    return {"http_status": status, "response": decoded, "attempts": attempt_count}
+
+
+def _response_output(result: dict) -> list[dict]:
+    response = result.get("response")
+    if not isinstance(response, dict) or not isinstance(response.get("output"), list):
+        return []
+    return [item for item in response["output"] if isinstance(item, dict)]
+
+
+def _compaction_item(result: dict) -> dict | None:
+    items = [item for item in _response_output(result) if item.get("type") in COMPACTION_ITEM_TYPES]
+    return items[0] if len(items) == 1 else None
+
+
+def _legacy_output_text(result: dict) -> str:
+    values: list[str] = []
+    for item in _response_output(result):
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                values.append(block["text"])
+    return "\n".join(values)
+
+
 def compaction_probe(base_url: str, token: str, model: str, timeout: int) -> dict:
-    body = json.dumps(
+    """Backward-compatible v2 probe used by callers of the V2.0 API."""
+
+    result = _post_response(
+        base_url,
+        "responses",
         {
             "model": model,
             "input": [
-                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Preserve the fact: bridge-probe."}]},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Preserve exactly: bridge-probe."}],
+                },
                 {"type": "compaction_trigger"},
             ],
             "stream": False,
-        }
-    ).encode()
-    request = urllib.request.Request(
-        f"{base_url.rstrip('/')}/responses",
-        data=body,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        method="POST",
+        },
+        timeout,
+        token,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.load(response)
-        output = payload.get("output", []) if isinstance(payload, dict) else []
-        types = [item.get("type") for item in output if isinstance(item, dict)]
-        return {"status": "supported" if types == ["compaction"] else "incompatible", "output_types": types}
-    except urllib.error.HTTPError as exc:
-        return {"status": "incompatible", "http_status": exc.code}
-    except OSError as exc:
-        return {"status": "unavailable", "error": type(exc).__name__}
+    item = _compaction_item(result)
+    output_types = [value.get("type") for value in _response_output(result)]
+    if item:
+        return {
+            "status": "supported",
+            "output_types": output_types,
+            "synthetic": str(item.get("encrypted_content", "")).startswith(OCX_COMPACTION_PREFIX),
+            "attempts": result.get("attempts"),
+        }
+    if result.get("http_status") is None:
+        return {"status": "unavailable", "error": result.get("error", "unavailable")}
+    return {
+        "status": "incompatible",
+        "http_status": result.get("http_status"),
+        "output_types": output_types,
+        "attempts": result.get("attempts"),
+    }
+
+
+def _legacy_compaction_probe(base_url: str, model: str, marker: str, timeout: int) -> dict:
+    result = _post_response(
+        base_url,
+        "responses/compact",
+        {
+            "model": model,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": f"Preserve exactly: {marker}"}],
+                }
+            ],
+            "stream": False,
+        },
+        timeout,
+    )
+    output = _response_output(result)
+    text = _legacy_output_text(result)
+    ready = result.get("http_status") == 200 and bool(output) and marker in text
+    return {
+        "status": "supported" if ready else "incompatible",
+        "http_status": result.get("http_status"),
+        "replacement_items": len(output),
+        "marker_preserved": marker in text,
+        "attempts": result.get("attempts"),
+    }
+
+
+def _v2_compaction_probe(base_url: str, model: str, marker: str, timeout: int) -> tuple[dict, dict | None]:
+    result = _post_response(
+        base_url,
+        "responses",
+        {
+            "model": model,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": f"Preserve exactly: {marker}"}],
+                },
+                {"type": "compaction_trigger"},
+            ],
+            "stream": True,
+        },
+        timeout,
+    )
+    item = _compaction_item(result)
+    event_types = [event.get("type") for event in result.get("events", []) if isinstance(event, dict)]
+    relevant = [
+        value
+        for value in event_types
+        if value in {
+            "response.created",
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.completed",
+        }
+    ]
+    event_order_ok = relevant == [
+        "response.created",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.completed",
+    ]
+    ready = result.get("http_status") == 200 and item is not None and event_order_ok
+    return (
+        {
+            "status": "supported" if ready else "incompatible",
+            "http_status": result.get("http_status"),
+            "event_order_ok": event_order_ok,
+            "compaction_items": 1 if item else 0,
+            "synthetic": bool(
+                item and str(item.get("encrypted_content", "")).startswith(OCX_COMPACTION_PREFIX)
+            ),
+            "attempts": result.get("attempts"),
+        },
+        item,
+    )
+
+
+def _completion_probe(base_url: str, model: str, marker: str, timeout: int, history: list[dict] | None = None) -> dict:
+    items = list(history or [])
+    items.append(
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": f"Reply with exactly: {marker}"}],
+        }
+    )
+    result = _post_response(
+        base_url,
+        "responses",
+        {"model": model, "input": items, "stream": False, "store": False},
+        timeout,
+    )
+    text = extract_output_text(result.get("response"))
+    return {
+        "status": "supported" if result.get("http_status") == 200 and marker in text else "incompatible",
+        "http_status": result.get("http_status"),
+        "marker_returned": marker in text,
+        "attempts": result.get("attempts"),
+    }
+
+
+def verify_model_compaction(base_url: str, model: str, timeout: int) -> dict:
+    marker = f"bridge-compaction-marker-{hashlib.sha256(f'{model}-{time.time_ns()}'.encode()).hexdigest()[:16]}"
+    legacy = _legacy_compaction_probe(base_url, model, marker, timeout)
+    v2, item = _v2_compaction_probe(base_url, model, marker, timeout)
+    replay = (
+        _completion_probe(base_url, model, marker, timeout, [item])
+        if item
+        else {"status": "incompatible", "http_status": None, "marker_returned": False}
+    )
+    ordinary_marker = f"bridge-normal-{hashlib.sha256(marker.encode()).hexdigest()[:12]}"
+    ordinary = _completion_probe(base_url, model, ordinary_marker, timeout)
+    ready = all(value.get("status") == "supported" for value in (legacy, v2, replay, ordinary))
+    return {
+        "status": "ready" if ready else "blocked",
+        "legacy_v1": legacy,
+        "remote_v2": v2,
+        "replay": replay,
+        "ordinary_response": ordinary,
+        "secrets_redacted": True,
+    }
 
 
 def set_toml_table_bool(text: str, table: str, key: str, value: bool) -> str:
@@ -1204,35 +1601,411 @@ def set_toml_table_bool(text: str, table: str, key: str, value: bool) -> str:
     return "".join(lines)
 
 
-def cmd_local_compaction(args: argparse.Namespace) -> None:
-    config = Path(args.config).expanduser()
-    state_dir = Path(args.state_dir).expanduser()
+def _get_health(base_url: str, timeout: int = 5) -> dict | None:
     try:
-        current = config.read_text(encoding="utf-8")
-        tomllib.loads(current)
+        with urllib.request.urlopen(_health_url(base_url), timeout=timeout) as response:
+            payload = json.load(response)
+        return payload if isinstance(payload, dict) else None
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+
+
+def _live_model_ids(base_url: str, timeout: int = 10) -> set[str]:
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/models",
+        headers={"Authorization": "Bearer codex-bridge-probe"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        payload = json.load(response)
+    return {
+        item["id"]
+        for item in payload.get("data", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+
+
+def _catalog_model_ids(path: Path) -> list[str]:
+    payload = read_json(path)
+    models = payload.get("models")
+    if not isinstance(models, list):
+        raise DeploymentError("model catalog has no models array")
+    return [
+        item["slug"]
+        for item in models
+        if isinstance(item, dict) and isinstance(item.get("slug"), str)
+    ]
+
+
+def _selected_compaction_models(raw: str, catalog: Path) -> list[str]:
+    if raw.strip().lower() == "all":
+        return _catalog_model_ids(catalog)
+    models = [item.strip() for item in raw.split(",") if item.strip()]
+    if not models:
+        raise DeploymentError("--models is empty")
+    return list(dict.fromkeys(models))
+
+
+def cmd_compaction_audit(args: argparse.Namespace) -> None:
+    config_path = Path(args.config).expanduser()
+    catalog_path = Path(args.catalog).expanduser()
+    try:
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        models = _selected_compaction_models(args.models, catalog_path)
+        live = _live_model_ids(args.proxy_url, args.timeout)
+        health = _get_health(args.proxy_url)
+        matrix: dict[str, dict] = {}
+
+        def inspect(model: str) -> tuple[str, dict]:
+            if model not in live:
+                return model, {"status": "unavailable", "legacy_v1": None, "remote_v2": None}
+            marker = f"bridge-audit-{hashlib.sha256(f'{model}-{time.time_ns()}'.encode()).hexdigest()[:12]}"
+            legacy = _legacy_compaction_probe(args.proxy_url, model, marker, args.timeout)
+            v2, _item = _v2_compaction_probe(args.proxy_url, model, marker, args.timeout)
+            status = "ready" if legacy["status"] == "supported" and v2["status"] == "supported" else "blocked"
+            return model, {"status": status, "legacy_v1": legacy, "remote_v2": v2}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            for model, result in pool.map(inspect, models):
+                matrix[model] = result
+        flag = config.get("features", {}).get("remote_compaction_v2")
+        protocol = (health or {}).get("compaction", {}).get("protocol_version")
+        optional = {item.strip() for item in args.optional_model.split(",") if item.strip()}
+        blocking = [
+            model
+            for model, result in matrix.items()
+            if result["status"] == "blocked" or (result["status"] == "unavailable" and model not in optional)
+        ]
+        ready = flag is True and protocol == "2" and not blocking
+        emit(
+            {
+                "status": "ready" if ready else "blocked",
+                "config": str(config_path),
+                "remote_compaction_v2": flag,
+                "legacy_false_is_blocking": flag is False,
+                "proxy_url": args.proxy_url,
+                "proxy_health": health,
+                "live_model_count": len(live),
+                "matrix": matrix,
+                "blocking_models": blocking,
+                "secrets_redacted": True,
+            },
+            0 if ready else 2,
+        )
+    except (DeploymentError, OSError, ValueError, tomllib.TOMLDecodeError, urllib.error.URLError) as exc:
+        emit({"status": "blocked", "error": str(exc), "secrets_redacted": True}, 2)
+
+
+def _compaction_configure_bridge_args(args: argparse.Namespace, expected_sha256: str | None = None) -> list[str]:
+    values = [
+        "configure-desktop",
+        "--config",
+        str(Path(args.config).expanduser()),
+        "--state-db",
+        str(Path(args.state_db).expanduser()),
+        "--catalog",
+        str(Path(args.catalog).expanduser()),
+        "--auth-file",
+        str(Path(args.auth_file).expanduser()),
+        "--helper",
+        str(Path(args.helper).expanduser()),
+        "--proxy-url",
+        args.upstream_url,
+        "--transparent-url",
+        args.proxy_url,
+        "--runtime-script",
+        str(Path(args.runtime_script).expanduser()),
+        "--launch-agent",
+        str(Path(args.launch_agent).expanduser()),
+        "--systemd-unit",
+        str(Path(args.systemd_unit).expanduser()),
+        "--windows-task-name",
+        args.windows_task_name,
+    ]
+    if expected_sha256:
+        values.extend(["--expected-sha256", expected_sha256])
+    return values
+
+
+def cmd_compaction_configure(args: argparse.Namespace) -> None:
+    state_dir = Path(args.state_dir).expanduser()
+    config_path = Path(args.config).expanduser()
+    auth_path = Path(args.auth_file).expanduser()
+    runtime = Path(args.runtime_script).expanduser()
+    service_path = (
+        Path(args.launch_agent).expanduser()
+        if platform.system() == "Darwin"
+        else Path(args.systemd_unit).expanduser()
+        if platform.system() == "Linux"
+        else runtime.with_name("transparent_proxy.cmd")
+    )
+    tracked = [config_path, runtime, runtime.with_name("compaction.py"), service_path]
+    try:
+        current = config_path.read_text(encoding="utf-8")
+        parsed_before = tomllib.loads(current)
         current_sha = sha256_bytes(current.encode())
-        if args.expected_sha256 and current_sha != args.expected_sha256:
+        if args.expected_sha256 and args.expected_sha256 != current_sha:
             raise DeploymentError("Codex config changed after approval")
-        updated = set_toml_table_bool(current, "features", "remote_compaction_v2", False)
+        if args.apply and not args.expected_sha256:
+            raise DeploymentError("--apply requires the config SHA-256 from an approved dry-run")
+        if args.apply and not args.transaction_id:
+            raise DeploymentError("--apply requires the transaction id from an approved dry-run")
+        planned_transaction_id = validate_transaction_id(
+            args.transaction_id or f"{timestamp()}-compaction-configure"
+        )
+        preview = run_bridge(_compaction_configure_bridge_args(args))
+        resolved_tracked = list(dict.fromkeys(path.resolve() for path in tracked))
+        backup_root = transaction_dir(state_dir, planned_transaction_id) / "before"
+        backup_plan = [
+            {
+                "path": str(path),
+                "backup": str(backup_root / f"{index:03d}-{path.name}") if path.exists() else None,
+                "current_sha256": sha256_path(path),
+            }
+            for index, path in enumerate(resolved_tracked)
+        ]
         result = {
-            "status": "planned" if not args.apply else "unchanged",
-            "config": str(config),
+            "status": "planned",
+            "deprecated_alias": bool(getattr(args, "deprecated_alias", False)),
+            "setting": "features.remote_compaction_v2=true",
             "config_sha256": current_sha,
-            "changed": updated != current,
-            "setting": "features.remote_compaction_v2=false",
+            "diff": preview.get("diff"),
+            "runtime_script": str(runtime),
+            "compaction_runtime": str(runtime.with_name("compaction.py")),
+            "service": str(service_path),
+            "proxy_url": args.proxy_url,
+            "upstream_url": args.upstream_url,
+            "impact": {
+                "config": "enable features.remote_compaction_v2 and update only its managed explanatory comment",
+                "runtime": "install the Python authorization and dual-protocol compaction modules",
+                "service": "reload only the 8318 per-user transparent proxy definition",
+                "expected_interruption": "brief 8318 handoff while the approved service definition is reloaded",
+                "preserved": [
+                    "default model",
+                    "model_provider",
+                    "ChatGPT auth.json",
+                    "task rows and task inventory",
+                    "CLIProxyAPI 8317 service",
+                ],
+            },
+            "transaction": planned_transaction_id,
+            "backup_root": str(backup_root),
+            "backup_plan": backup_plan,
+            "apply_command": [
+                sys.executable,
+                str(BRIDGE_SCRIPT),
+                "compaction",
+                "configure",
+                "--config",
+                str(config_path),
+                "--state-db",
+                str(Path(args.state_db).expanduser()),
+                "--catalog",
+                str(Path(args.catalog).expanduser()),
+                "--auth-file",
+                str(auth_path),
+                "--helper",
+                str(Path(args.helper).expanduser()),
+                "--state-dir",
+                str(state_dir),
+                "--proxy-url",
+                args.proxy_url,
+                "--upstream-url",
+                args.upstream_url,
+                "--runtime-script",
+                str(runtime),
+                "--launch-agent",
+                str(Path(args.launch_agent).expanduser()),
+                "--systemd-unit",
+                str(Path(args.systemd_unit).expanduser()),
+                "--windows-task-name",
+                args.windows_task_name,
+                "--expected-sha256",
+                current_sha,
+                "--transaction-id",
+                planned_transaction_id,
+                "--apply",
+            ],
+            "rollback_command": [
+                sys.executable,
+                str(BRIDGE_SCRIPT),
+                "rollback",
+                "--transaction",
+                planned_transaction_id,
+                "--state-dir",
+                str(state_dir),
+            ],
+            "rollback_apply_command": [
+                sys.executable,
+                str(BRIDGE_SCRIPT),
+                "rollback",
+                "--transaction",
+                planned_transaction_id,
+                "--state-dir",
+                str(state_dir),
+                "--apply",
+            ],
+            "default_model_preserved": True,
+            "provider_preserved": True,
+            "secrets_redacted": True,
         }
         if not args.apply:
             emit(result)
-        transaction_id, tx = begin_transaction(state_dir, "local-compaction", [config])
-        if updated != current:
-            atomic_write_text(config, updated, 0o600)
-            tomllib.loads(config.read_text(encoding="utf-8"))
-            result["status"] = "applied"
-        finish_transaction(state_dir, tx)
-        result["transaction"] = transaction_id
-        emit(result)
-    except (DeploymentError, OSError, tomllib.TOMLDecodeError) as exc:
-        emit({"status": "blocked", "error": str(exc)}, 2)
+
+        transaction_id, tx = begin_transaction(
+            state_dir,
+            "compaction-configure",
+            tracked,
+            planned_transaction_id,
+        )
+        if platform.system() == "Darwin":
+            tx["services"] = [
+                {
+                    "kind": "launchagent",
+                    "identifier": "com.zhijian.codex-cli-model-bridge-transparent-proxy",
+                    "definition_path": str(service_path),
+                    "restart_after_restore": True,
+                }
+            ]
+        elif platform.system() == "Linux":
+            tx["services"] = [
+                {
+                    "kind": "systemd-user",
+                    "identifier": service_path.name,
+                    "definition_path": str(service_path),
+                    "restart_after_restore": True,
+                }
+            ]
+        elif platform.system() == "Windows":
+            tx["services"] = [
+                {
+                    "kind": "task-scheduler",
+                    "identifier": args.windows_task_name,
+                    "definition_path": str(service_path),
+                    "windows_task_name": args.windows_task_name,
+                    "restart_after_restore": True,
+                }
+            ]
+        auth_before = sha256_path(auth_path)
+        try:
+            applied = run_bridge(
+                [*_compaction_configure_bridge_args(args, current_sha), "--apply"],
+                timeout=120,
+            )
+            verified = tomllib.loads(config_path.read_text(encoding="utf-8"))
+            health = _get_health(args.proxy_url, timeout=10)
+            if verified.get("features", {}).get("remote_compaction_v2") is not True:
+                raise DeploymentError("remote_compaction_v2 was not enabled")
+            if verified.get("model") != parsed_before.get("model"):
+                raise DeploymentError("default model changed during compaction configuration")
+            if verified.get("model_provider", "openai") != parsed_before.get("model_provider", "openai"):
+                raise DeploymentError("model Provider changed during compaction configuration")
+            if auth_before != sha256_path(auth_path):
+                raise DeploymentError("ChatGPT auth file changed during compaction configuration")
+            if (health or {}).get("compaction", {}).get("protocol_version") != "2":
+                raise DeploymentError("compaction proxy protocol v2 health check failed")
+            finish_transaction(state_dir, tx)
+            result.update(
+                {
+                    "status": "applied",
+                    "transaction": transaction_id,
+                    "bridge": applied,
+                    "proxy_health": health,
+                }
+            )
+            emit(result)
+        except Exception as exc:
+            rollback_completed = False
+            service_restore: str | None = None
+            rollback_error: str | None = None
+            try:
+                restore_transaction(tx, require_after_match=False)
+                rollback_completed = True
+                service_restore = restore_transparent_service(service_path, args.windows_task_name)
+                if service_restore is None and _get_health(args.proxy_url, timeout=10) is None:
+                    service_restore = "restored transparent proxy failed its health check"
+            except Exception as rollback_exc:
+                rollback_error = f"{type(rollback_exc).__name__}: {rollback_exc}"
+            fail_transaction(
+                state_dir,
+                tx,
+                str(exc),
+                rollback_completed,
+                service_restore or rollback_error,
+            )
+            if not rollback_completed or service_restore or rollback_error:
+                detail = service_restore or rollback_error or "unknown rollback failure"
+                raise DeploymentError(f"{exc}; automatic rollback incomplete: {detail}") from exc
+            raise
+    except (DeploymentError, OSError, ValueError, tomllib.TOMLDecodeError, subprocess.TimeoutExpired) as exc:
+        emit({"status": "blocked", "error": str(exc), "secrets_redacted": True}, 2)
+
+
+def cmd_compaction_verify(args: argparse.Namespace) -> None:
+    catalog = Path(args.catalog).expanduser()
+    try:
+        models = _selected_compaction_models(args.models, catalog)
+        live = _live_model_ids(args.proxy_url, args.timeout)
+        optional = {item.strip() for item in args.optional_model.split(",") if item.strip()}
+        results: dict[str, dict] = {}
+
+        def verify(model: str) -> tuple[str, dict]:
+            if model not in live:
+                return model, {"status": "unavailable", "secrets_redacted": True}
+            return model, verify_model_compaction(args.proxy_url, model, args.timeout)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+            for model, result in pool.map(verify, models):
+                results[model] = result
+        blocking = [
+            model
+            for model, result in results.items()
+            if result.get("status") == "blocked"
+            or (result.get("status") == "unavailable" and model not in optional)
+        ]
+        health = _get_health(args.proxy_url)
+        ready = not blocking and (health or {}).get("compaction", {}).get("protocol_version") == "2"
+        emit(
+            {
+                "status": "ready" if ready else "blocked",
+                "proxy_url": args.proxy_url,
+                "models": results,
+                "blocking_models": blocking,
+                "optional_unavailable_models": sorted(optional),
+                "proxy_health": health,
+                "secrets_redacted": True,
+            },
+            0 if ready else 2,
+        )
+    except (DeploymentError, OSError, ValueError, urllib.error.URLError) as exc:
+        emit({"status": "blocked", "error": str(exc), "secrets_redacted": True}, 2)
+
+
+def cmd_local_compaction(args: argparse.Namespace) -> None:
+    """Compatibility alias. False now selects a retired remote endpoint."""
+
+    forwarded = argparse.Namespace(
+        config=args.config,
+        state_db=str(DEFAULT_CODEX_HOME / "state_5.sqlite"),
+        catalog=str(DEFAULT_CODEX_HOME / "model-catalog-cli-proxy.json"),
+        auth_file=str(DEFAULT_CODEX_HOME / "auth.json"),
+        helper=str(Path("~/.config/codex-cli-proxy/read-client-key.py").expanduser()),
+        state_dir=args.state_dir,
+        proxy_url=DEFAULT_TRANSPARENT_URL,
+        upstream_url=DEFAULT_PROXY_URL,
+        runtime_script=str(Path(args.state_dir).expanduser() / "transparent_proxy.py"),
+        launch_agent=str(
+            Path("~/Library/LaunchAgents/com.zhijian.codex-cli-model-bridge-transparent-proxy.plist").expanduser()
+        ),
+        systemd_unit=str(
+            Path("~/.config/systemd/user/codex-cli-model-bridge-transparent-proxy.service").expanduser()
+        ),
+        windows_task_name="CodexCliModelBridgeTransparentProxy",
+        expected_sha256=args.expected_sha256,
+        transaction_id=args.transaction_id,
+        apply=args.apply,
+        deprecated_alias=True,
+    )
+    cmd_compaction_configure(forwarded)
 
 
 def cmd_verify(args: argparse.Namespace) -> None:
@@ -1259,17 +2032,17 @@ def cmd_verify(args: argparse.Namespace) -> None:
             if args.desktop:
                 image_args.append("--desktop")
             image_probe = run_bridge(image_args, timeout=args.timeout * len(image_models))
-        token = proxy_token_from_config(Path(args.proxy_config).expanduser())
-        compaction = {model: compaction_probe(args.proxy_url, token, model, args.timeout) for model in models}
+        compaction = {
+            model: verify_model_compaction(args.compaction_url, model, args.timeout)
+            for model in models
+        }
         sync_one = run_bridge(["sync", "--state-dir", str(Path(args.state_dir).expanduser())])
         sync_two = run_bridge(["sync", "--state-dir", str(Path(args.state_dir).expanduser())])
         codex_config = Path(args.config).expanduser()
         config_data = tomllib.loads(codex_config.read_text(encoding="utf-8"))
-        local_compaction = config_data.get("features", {}).get("remote_compaction_v2") is False
-        incompatible = sorted(model for model, item in compaction.items() if item.get("status") == "incompatible")
-        compaction_ready = all(item.get("status") in {"supported", "incompatible"} for item in compaction.values()) and (
-            not incompatible or local_compaction
-        )
+        remote_compaction_v2 = config_data.get("features", {}).get("remote_compaction_v2") is True
+        incompatible = sorted(model for model, item in compaction.items() if item.get("status") != "ready")
+        compaction_ready = remote_compaction_v2 and not incompatible
         changes = sync_two.get("changes", {})
         sync_idempotent = not any(changes.get(key) for key in ("added", "updated", "removed"))
         ready = compaction_ready and sync_idempotent
@@ -1284,9 +2057,9 @@ def cmd_verify(args: argparse.Namespace) -> None:
                 "image_probe": image_probe,
                 "compaction": compaction,
                 "compaction_policy": {
-                    "local_compaction_enabled": local_compaction,
+                    "remote_compaction_v2": remote_compaction_v2,
                     "incompatible_models": incompatible,
-                    "next": "run local-compaction preview/apply" if incompatible and not local_compaction else None,
+                    "next": "run compaction configure, then compaction verify" if not compaction_ready else None,
                 },
                 "sync_idempotent": sync_idempotent and sync_one.get("changes") == sync_two.get("changes"),
                 "secrets_redacted": True,
@@ -1319,6 +2092,9 @@ def cmd_rollback(args: argparse.Namespace) -> None:
             raise DeploymentError("rollback refused because files changed: " + ", ".join(conflicts))
         stop_recorded_services(payload)
         restore_transaction(payload, require_after_match=False)
+        service_errors = restore_recorded_services(payload)
+        if service_errors:
+            raise DeploymentError("rollback restored files but not services: " + "; ".join(service_errors))
         payload["status"] = "rolled_back"
         payload["rolled_back_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         atomic_write_text(transaction_path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -1379,6 +2155,60 @@ def register_deployment_parsers(sub: argparse._SubParsersAction) -> None:
     activate.add_argument("--apply", action="store_true")
     activate.set_defaults(func=cmd_activate)
 
+    compaction = sub.add_parser("compaction", help="Audit, configure, or verify Codex compaction")
+    compaction_sub = compaction.add_subparsers(dest="compaction_command", required=True)
+
+    compaction_audit = compaction_sub.add_parser("audit")
+    compaction_audit.add_argument("--models", default="all")
+    compaction_audit.add_argument("--catalog", default=str(DEFAULT_CODEX_HOME / "model-catalog-cli-proxy.json"))
+    compaction_audit.add_argument("--config", default=str(DEFAULT_CODEX_HOME / "config.toml"))
+    compaction_audit.add_argument("--proxy-url", default=DEFAULT_TRANSPARENT_URL)
+    compaction_audit.add_argument("--optional-model", default="gpt-reserve")
+    compaction_audit.add_argument("--workers", type=int, default=3)
+    compaction_audit.add_argument("--timeout", type=int, default=180)
+    compaction_audit.set_defaults(func=cmd_compaction_audit)
+
+    compaction_configure = compaction_sub.add_parser("configure")
+    compaction_configure.add_argument("--config", default=str(DEFAULT_CODEX_HOME / "config.toml"))
+    compaction_configure.add_argument("--state-db", default=str(DEFAULT_CODEX_HOME / "state_5.sqlite"))
+    compaction_configure.add_argument("--catalog", default=str(DEFAULT_CODEX_HOME / "model-catalog-cli-proxy.json"))
+    compaction_configure.add_argument("--auth-file", default=str(DEFAULT_CODEX_HOME / "auth.json"))
+    compaction_configure.add_argument(
+        "--helper", default=str(Path("~/.config/codex-cli-proxy/read-client-key.py").expanduser())
+    )
+    compaction_configure.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR))
+    compaction_configure.add_argument("--proxy-url", default=DEFAULT_TRANSPARENT_URL)
+    compaction_configure.add_argument("--upstream-url", default=DEFAULT_PROXY_URL)
+    compaction_configure.add_argument(
+        "--runtime-script", default=str(DEFAULT_STATE_DIR / "transparent_proxy.py")
+    )
+    compaction_configure.add_argument(
+        "--launch-agent",
+        default=str(
+            Path("~/Library/LaunchAgents/com.zhijian.codex-cli-model-bridge-transparent-proxy.plist").expanduser()
+        ),
+    )
+    compaction_configure.add_argument(
+        "--systemd-unit",
+        default=str(
+            Path("~/.config/systemd/user/codex-cli-model-bridge-transparent-proxy.service").expanduser()
+        ),
+    )
+    compaction_configure.add_argument("--windows-task-name", default="CodexCliModelBridgeTransparentProxy")
+    compaction_configure.add_argument("--expected-sha256")
+    compaction_configure.add_argument("--transaction-id")
+    compaction_configure.add_argument("--apply", action="store_true")
+    compaction_configure.set_defaults(func=cmd_compaction_configure, deprecated_alias=False)
+
+    compaction_verify = compaction_sub.add_parser("verify")
+    compaction_verify.add_argument("--models", default="all")
+    compaction_verify.add_argument("--catalog", default=str(DEFAULT_CODEX_HOME / "model-catalog-cli-proxy.json"))
+    compaction_verify.add_argument("--proxy-url", default=DEFAULT_TRANSPARENT_URL)
+    compaction_verify.add_argument("--optional-model", default="gpt-reserve")
+    compaction_verify.add_argument("--workers", type=int, default=3)
+    compaction_verify.add_argument("--timeout", type=int, default=180)
+    compaction_verify.set_defaults(func=cmd_compaction_verify)
+
     verify = sub.add_parser("verify", help="Run the end-to-end completion gate")
     verify.add_argument("--models", required=True)
     verify.add_argument("--desktop", action="store_true")
@@ -1387,15 +2217,20 @@ def register_deployment_parsers(sub: argparse._SubParsersAction) -> None:
     verify.add_argument("--multi-agent", action="store_true")
     verify.add_argument("--timeout", type=int, default=180)
     verify.add_argument("--proxy-url", default=DEFAULT_PROXY_URL)
+    verify.add_argument("--compaction-url", default=DEFAULT_TRANSPARENT_URL)
     verify.add_argument("--proxy-config", default=str(DEFAULT_PROXY_CONFIG))
     verify.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR))
     verify.add_argument("--config", default=str(DEFAULT_CODEX_HOME / "config.toml"))
     verify.set_defaults(func=cmd_verify)
 
-    local_compaction = sub.add_parser("local-compaction", help="Use Codex local compaction for incompatible routes")
+    local_compaction = sub.add_parser(
+        "local-compaction",
+        help="Deprecated alias for compaction configure; never writes remote_compaction_v2=false",
+    )
     local_compaction.add_argument("--config", default=str(DEFAULT_CODEX_HOME / "config.toml"))
     local_compaction.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR))
     local_compaction.add_argument("--expected-sha256")
+    local_compaction.add_argument("--transaction-id")
     local_compaction.add_argument("--apply", action="store_true")
     local_compaction.set_defaults(func=cmd_local_compaction)
 
