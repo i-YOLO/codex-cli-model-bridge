@@ -1,10 +1,10 @@
-# Codex CLI Model Bridge V2.1
+# Codex CLI Model Bridge V2.1.1
 
 在保留 Codex ChatGPT 登录和既有任务历史的前提下，把经过真实验收的 Gemini、DeepSeek、GLM、Grok 或自定义兼容模型接入 Codex CLI 与 Codex Desktop 原生模型选择器。
 
 正式仓库：[i-YOLO/codex-cli-model-bridge](https://github.com/i-YOLO/codex-cli-model-bridge)
 
-本项目基于 [Zhijian AI 的 MIT `codex-cli-model-bridge`](https://github.com/zjp1997720/zhijian-skills/tree/main/skills/codex-cli-model-bridge) 升级。V2 新增从零安装、三端用户级常驻、API Key/OAuth Provider、事务回滚、Python 透明代理、通用 ProviderSpec 和完整部署验收；V2.1 补齐旧／新双协议上下文压缩、跨路由切换回放和安全服务切换。详见 [NOTICE](NOTICE)。
+本项目基于 [Zhijian AI 的 MIT `codex-cli-model-bridge`](https://github.com/zjp1997720/zhijian-skills/tree/main/skills/codex-cli-model-bridge) 升级。V2 新增从零安装、三端用户级常驻、API Key/OAuth Provider、事务回滚、Python 透明代理、通用 ProviderSpec 和完整部署验收；V2.1 补齐旧／新双协议上下文压缩、跨路由切换回放和安全服务切换；V2.1.1 增加 zstd 请求体支持、未知编码安全透传、异步服务重启加固、comp_hash 对齐指引和请求捕获诊断。详见 [NOTICE](NOTICE)。
 
 ## 能做什么
 
@@ -119,7 +119,13 @@ python3 scripts/bridge.py compaction verify --models all
 
 原生 GPT 的 v2 压缩保持透传。Gemini、GLM、DeepSeek 等路由由当前目标模型自己生成摘要，8318 将其封装为唯一 `ocx1:` compaction item，并在下一轮解码回放；失败不会偷偷把第三方历史发送给 GPT。请求体支持 identity、gzip、deflate 和 Python 3.14 的 zstd；无法识别的编码会原样透传，避免让普通 Codex 请求统一报 415，但仍须通过真实 zstd 压缩／回放探针才算兼容。旧 `local-compaction` 只保留为兼容别名，不会再写入危险的 `false`。
 
+跨路由切换的压缩触发与上下文用量无关：Codex 比较模型目录条目的 `comp_hash`，新旧不同即在回合开始前触发远程压缩（`reason: comp_hash_changed`）。该请求是**不带对话内容的 GET**，只有仍持有线程状态的服务端才能应答；CLIProxyAPI 是无状态转发，第三方路由必然失败并报 `expected exactly one compaction output item`。因此本 Skill 的模型目录让所有第三方模型共用同一个 `comp_hash`，从源头避免该触发；原生 GPT 条目保持上游原值，重建目录时必须保持这一对齐。
+
 完整协议、跨路由触发依据和安全上线闸门见 [上下文压缩说明](references/compaction.md)。
+
+## 请求捕获诊断
+
+排查压缩或路由的疑难请求形状时，创建 `~/.config/codex-cli-model-bridge/capture.enabled` 并重现一次；代理会把请求行、白名单请求头与解码后的请求体写入同目录的 `capture/` 子文件夹（绝不写入 `Authorization` 或其他凭据头）。诊断结束删除哨兵文件与 `capture/` 目录即可关闭。
 
 ## Gemini
 
@@ -163,6 +169,8 @@ python3 scripts/bridge.py provider add --spec /absolute/path/provider.json
 | Subagent 422 `ModelInput` | 检查 `agent_message` 转换 | 不在 8318 重写全部协议 |
 | Subagent 返回 200 但没收到任务 | 检查严格 marker；必要时显式改用 Chat 兼容预设 | 不把 200 或耗时当多 Agent 通过 |
 | 压缩请求 `/responses/compact` 返回 404/501 | 检查 `remote_compaction_v2` 与 8318 协议版本 | 不把 `false` 当本地压缩 |
+| 跨路由换模型立即压缩并报 `expected exactly one compaction output item` | 检查模型目录第三方条目的 `comp_hash` 是否不再一致 | 不删除目录条目，也不伪造更大的 context window |
+| 全部模型请求统一 415 | 查 8318 health 的 `last_error_type`（常见为新版请求压缩编码） | 不重装 Codex，也不重登账号 |
 | 跨路由换模型后立即压缩 | 这是路由边界 checkpoint；验证 v2 与回放 marker | 不伪造更大的 context window，也不关闭压缩 |
 | `compaction_trigger` 只返回普通 message | 启用同模型 `ocx1:` 适配并要求唯一 compaction item | 不把普通 assistant 摘要当压缩成功 |
 | 历史“消失” | 对比根 Provider 与任务 Provider 分布 | 不修改 SQLite 任务行 |

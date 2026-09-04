@@ -19,7 +19,9 @@ A route-boundary switch and token-pressure compaction are different triggers.
 - A change between upstream routes may checkpoint before the first turn on the target model so provider-specific reasoning or encrypted state is not replayed unchanged.
 - This can happen when current usage is far below both models' effective context windows. Increasing catalog context metadata does not fix it.
 
-Diagnose with task events and catalog metadata. Compare the model before and after the switch, live route selection, last-turn token usage, and effective context window. Do not infer the trigger from the UI label alone.
+The decisive field is `comp_hash` in each model catalog entry, not token usage. Codex compares the old and new model's `comp_hash`: different values start a pre-turn remote compaction labelled `reason: comp_hash_changed`; the same value continues history directly. Switches inside one `comp_hash` group never compact, even at 45k tokens of a 1M window.
+
+Keep every third-party entry in `model_catalog_json` on one shared `comp_hash` value. The shipped catalog assigns the same value to DeepSeek, Gemini, and GLM so route switches continue history directly; native GPT entries keep their upstream value and must stay untouched. If you regenerate the catalog, preserve this alignment or cross-route switches will checkpoint again.
 
 ## 8318 compatibility contract
 
@@ -36,6 +38,25 @@ The Python loopback proxy owns only the compatibility boundary:
 Compaction bodies accept identity, gzip/x-gzip, deflate, and zstd with a 32 MiB decoded limit. The dependency-free zstd path uses Python 3.14's `compression.zstd`; run a real zstd v2 plus replay probe before claiming Desktop compatibility. If the current interpreter cannot decode an unfamiliar encoding, the proxy forwards the original body unchanged instead of blocking all Codex traffic with 415. That bypass preserves transport availability but does not by itself prove synthetic compaction compatibility. Health counters report protocol version, v1/v2 counts, successes/failures, replay decodes, and the last error type; they never expose bodies, summaries, accounts, or credentials.
 
 The `ocx1:` envelope follows the public compatibility convention documented by [OpenCodex](https://github.com/lidge-jun/opencodex/blob/main/src/responses/compaction.ts). It is not presented as an OpenAI-encrypted blob.
+
+## Field-captured compaction shapes (Codex Desktop 0.152.1)
+
+With `x-codex-beta-features: remote_compaction_v2`, the pre-turn checkpoint is not one of the POST shapes above. The client sends:
+
+```text
+GET /v1/responses
+x-codex-turn-metadata: {..., "request_kind": "compaction",
+  "compaction": {"trigger": "auto", "reason": "comp_hash_changed",
+                 "implementation": "responses_compaction_v2",
+                 "phase": "pre_turn", "strategy": "memento"}, ...}
+x-codex-routing-hint: model=<source-model>
+```
+
+The request carries no body: the client expects a server that still holds the thread state (`strategy: memento`) and answers with exactly one compaction output item. CLIProxyAPI is a stateless forwarder, so a tunneled GET can only return ordinary reasoning or message items, and Codex aborts with `remote compaction v2 expected exactly one compaction output item`. Because no conversation content is attached, no stateless proxy can answer this shape for a third-party route.
+
+The practical fix is prevention, not interception: keep one shared `comp_hash` across third-party catalog entries so `comp_hash_changed` never fires. The POST-based v2 (`compaction_trigger`) and legacy v1 interception remain supported for clients and builds that use them.
+
+To capture live request shapes, create `~/.config/codex-cli-model-bridge/capture.enabled`, reproduce the flow once, and read the numbered files under `~/.config/codex-cli-model-bridge/capture/`. The proxy records each request line, allow-listed headers (`content-type`, `content-encoding`, `content-length`, `transfer-encoding`, `x-codex-*`), and the decoded body; it never writes `Authorization` or any other credential header. Delete the sentinel file and the `capture/` directory when finished.
 
 ## Safe rollout
 

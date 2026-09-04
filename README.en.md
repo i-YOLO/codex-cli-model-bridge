@@ -1,10 +1,10 @@
-# Codex CLI Model Bridge V2.1
+# Codex CLI Model Bridge V2.1.1
 
 Deploy verified Gemini, DeepSeek, GLM, Grok, or compatible custom models into Codex CLI and the Codex Desktop model picker while preserving ChatGPT login and existing task history.
 
 Official repository: [i-YOLO/codex-cli-model-bridge](https://github.com/i-YOLO/codex-cli-model-bridge)
 
-This is an MIT-licensed derivative of [Zhijian AI's `codex-cli-model-bridge`](https://github.com/zjp1997720/zhijian-skills/tree/main/skills/codex-cli-model-bridge). V2 adds zero-to-one installation, per-user services for macOS/Windows/Linux, API-key and OAuth provider onboarding, transactional rollback, a dependency-free Python transparent proxy, generic ProviderSpec support, and end-to-end Codex verification. V2.1 adds legacy/v2 compaction compatibility, cross-route checkpoint replay, and guarded service handoff. See [NOTICE](NOTICE).
+This is an MIT-licensed derivative of [Zhijian AI's `codex-cli-model-bridge`](https://github.com/zjp1997720/zhijian-skills/tree/main/skills/codex-cli-model-bridge). V2 adds zero-to-one installation, per-user services for macOS/Windows/Linux, API-key and OAuth provider onboarding, transactional rollback, a dependency-free Python transparent proxy, generic ProviderSpec support, and end-to-end Codex verification. V2.1 adds legacy/v2 compaction compatibility, cross-route checkpoint replay, and guarded service handoff. V2.1.1 adds zstd request-body support, safe pass-through of unknown encodings, a hardened asynchronous service restart, `comp_hash` alignment guidance, and request-capture diagnostics. See [NOTICE](NOTICE).
 
 ## Architecture
 
@@ -91,7 +91,13 @@ python3 scripts/bridge.py compaction verify --models all
 
 Native GPT v2 compaction passes through. Gemini, GLM, DeepSeek, and other routed targets summarize with that same current target model; 8318 wraps the result as exactly one replayable `ocx1:` compaction item. Request bodies support identity, gzip, deflate, and Python 3.14 zstd. Unknown encodings are forwarded unchanged to avoid a blanket 415, but that bypass is not considered synthetic-compaction proof; a real zstd compaction and replay probe is still required. Failure never silently sends third-party history to GPT. The legacy `local-compaction` command is now only a deprecated alias and never writes the unsafe `false` setting.
 
-See [Compaction and cross-route checkpoints](references/compaction.md) for the full protocol and rollout gates.
+Cross-route switching does not compact because of context usage: Codex compares the `comp_hash` of the catalog entries, and any difference starts a pre-turn remote compaction (`reason: comp_hash_changed`). That request is a **GET without a body**; only a server that still holds the thread state can answer it, and the stateless CLIProxyAPI forwarder necessarily fails with `expected exactly one compaction output item`. The shipped catalog therefore keeps one shared `comp_hash` across all third-party models so this trigger never fires, while native GPT entries keep their upstream value. Preserve that alignment whenever the catalog is regenerated.
+
+See [Compaction and cross-route checkpoints](references/compaction.md) for the full protocol, the field-captured request shapes, and the rollout gates.
+
+## Request capture diagnostics
+
+To debug an awkward compaction or routing shape, create `~/.config/codex-cli-model-bridge/capture.enabled` and reproduce once. The proxy then writes each request line, allow-listed headers, and the decoded body into the `capture/` folder next to it; it never writes `Authorization` or any other credential header. Delete the sentinel file and the `capture/` folder to switch capture off.
 
 ## Provider presets
 
