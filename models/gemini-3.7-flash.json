@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "slug": "gemini-3.7-flash",
+  "display_name": "Gemini 3.7 Flash",
+  "description": "Gemini 3.7 Flash through a verified local CLIProxyAPI route.",
+  "template_slug": "gpt-5.6-sol",
+  "context_window": 1048576,
+  "effective_context_window_percent": 95,
+  "default_reasoning_level": "high",
+  "reasoning_efforts": ["low", "medium", "high"],
+  "input_modalities": ["text", "image"],
+  "tool_mode": null,
+  "supports_search_tool": false,
+  "priority": 30,
+  "source_url": "https://ai.google.dev/gemini-api/docs/openai",
+  "verified_at": "2026-09-04"
+}

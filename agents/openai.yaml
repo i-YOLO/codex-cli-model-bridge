@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex CLI Model Bridge"
+  short_description: "Deploy third-party models without hiding ChatGPT history"
+  default_prompt: "Use $codex-cli-model-bridge to audit my Codex setup, preserve my ChatGPT login and task history, deploy the requested model through a loopback CLIProxyAPI bridge, create the fallback profile, verify tools and compaction, and report the rollback transaction."

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "gemini-api",
+  "adapter": "gemini-api-key",
+  "auth_mode": "api-key",
+  "base_url": "https://generativelanguage.googleapis.com",
+  "routing_prefix": "",
+  "models": [
+    {"upstream_id": "gemini-3.7-flash", "slug": "gemini-3.7-flash"},
+    {"upstream_id": "gemini-3.8-flash", "slug": "gemini-3.8-flash"}
+  ]
+}

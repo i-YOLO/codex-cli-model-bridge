@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "id": "example-provider",
+  "adapter": "openai-compatibility",
+  "auth_mode": "api-key",
+  "base_url": "https://provider.example/v1",
+  "routing_prefix": "",
+  "models": [
+    {
+      "upstream_id": "upstream-model-id",
+      "slug": "example-model-id",
+      "display_name": "Example Model",
+      "description": "Example model through a verified local CLIProxyAPI route.",
+      "template_slug": "gpt-5.6-sol",
+      "context_window": 131072,
+      "effective_context_window_percent": 95,
+      "default_reasoning_level": "high",
+      "reasoning_efforts": ["low", "high"],
+      "input_modalities": ["text"],
+      "tool_mode": null,
+      "supports_search_tool": false,
+      "priority": 100
+    }
+  ]
+}

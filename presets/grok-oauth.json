@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "grok-oauth",
+  "adapter": "oauth",
+  "auth_mode": "oauth",
+  "oauth_channel": "grok",
+  "terms_notice": "Grok OAuth is handled by third-party CLIProxyAPI. Review the provider terms before browser authorization.",
+  "models": [
+    {"upstream_id": "grok-4.6", "slug": "grok-4.6"}
+  ]
+}

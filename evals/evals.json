@@ -1,0 +1,45 @@
+{
+  "skill_name": "codex-cli-model-bridge",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "在一台新 Mac 上保留我的 Codex 登录，把 DeepSeek V4 Pro 放进桌面模型菜单。",
+      "expected_output": "Audits first, previews verified CLIProxyAPI bootstrap, asks the user to enter the key in a hidden local prompt, creates the fallback profile, activates Desktop only after history/login guards, and reports transactions."
+    },
+    {
+      "id": 2,
+      "prompt": "Windows 上帮我接 Gemini，我可以用 API Key，也可以登录账号。",
+      "expected_output": "Asks the user to choose official key, HTTPS relay key, or OAuth; never auto-selects existing credentials; uses Python and current-user logon tasks without requiring Node or macOS tooling."
+    },
+    {
+      "id": 3,
+      "prompt": "我有一个 OpenAI 兼容中转站和自定义模型，帮我接到 Codex。",
+      "expected_output": "Requires an HTTPS endpoint and a secret-free ProviderSpec with complete model metadata, stages the key locally, refuses collisions, and does not declare support until Codex-level probes pass."
+    },
+    {
+      "id": 4,
+      "prompt": "把 GLM 普通 API 的 GLM-5.3 和 GLM-5.3-Flash 接进来，不要用 Coding Plan。",
+      "expected_output": "Uses the glm-standard preset, never infers Coding Plan from key shape, preserves other providers, and verifies actual routes and tools."
+    },
+    {
+      "id": 5,
+      "prompt": "DeepSeek 多 Agent 返回 200，为什么子 Agent 还是没干活？",
+      "expected_output": "Treats 200 without the delegated marker as task-delivery failure, does not call the model slow, and offers the explicit Chat-compatibility preset only after explaining and re-probing the adapter change."
+    },
+    {
+      "id": 6,
+      "prompt": "Gemini 说自己是 GPT，所以是不是路由错了？",
+      "expected_output": "Rejects self-description as evidence and correlates requested slug, alias, selected proxy provider, upstream result, response model, and Codex rollout."
+    },
+    {
+      "id": 7,
+      "prompt": "模型能聊天但不会执行 shell，而且长对话压缩也报错。",
+      "expected_output": "Checks model-scoped tool transport metadata and real command events, separately probes compaction output types, and previews the local-compaction fallback without changing unrelated models."
+    },
+    {
+      "id": 8,
+      "prompt": "把刚才的多模型配置全部撤回。",
+      "expected_output": "Previews the exact transaction rollback, refuses files changed afterward, stops only services created by that transaction, and preserves unrelated credentials and task history."
+    }
+  ]
+}

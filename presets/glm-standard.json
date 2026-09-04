@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "glm-standard",
+  "adapter": "openai-compatibility",
+  "auth_mode": "api-key",
+  "base_url": "https://open.bigmodel.cn/api/paas/v4",
+  "routing_prefix": "",
+  "models": [
+    {"upstream_id": "glm-5.3", "slug": "glm-5.3"},
+    {"upstream_id": "glm-5.3-flash", "slug": "glm-5.3-flash"}
+  ]
+}

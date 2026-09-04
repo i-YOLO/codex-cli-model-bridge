@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "antigravity-oauth",
+  "adapter": "oauth",
+  "auth_mode": "oauth",
+  "oauth_channel": "antigravity",
+  "terms_notice": "Antigravity OAuth is handled by third-party CLIProxyAPI. Review Google's terms and choose it explicitly; this Skill never copies another app's token.",
+  "models": [
+    {"upstream_id": "gemini-3.7-flash-high", "slug": "gemini-3.7-flash"},
+    {"upstream_id": "gemini-3.8-flash-high", "slug": "gemini-3.8-flash"}
+  ]
+}
