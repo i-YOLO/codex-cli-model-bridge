@@ -54,6 +54,54 @@ MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_FORWARD_BODY_BYTES = 128 * 1024 * 1024
 SUMMARY_TIMEOUT = int(os.environ.get("CODEX_BRIDGE_COMPACTION_TIMEOUT", "180"))
 SUMMARY_ATTEMPTS = int(os.environ.get("CODEX_BRIDGE_COMPACTION_ATTEMPTS", "3"))
+CAPTURE_DIR = Path.home() / ".config" / "codex-cli-model-bridge" / "capture"
+CAPTURE_SENTINEL = CAPTURE_DIR.parent / "capture.enabled"
+_CAPTURE_LOCK = threading.Lock()
+_CAPTURE_SEQ = 0
+
+
+def capture_enabled() -> bool:
+    return CAPTURE_SENTINEL.exists()
+
+
+_CAPTURE_HEADER_ALLOW = {"content-type", "content-encoding", "content-length", "transfer-encoding"}
+
+
+def capture_probe(request_line: str, headers: list[tuple[str, str]], remainder: bytes) -> None:
+    # Entry-level capture: records every POST before any branch can tunnel it.
+    # Only allow-listed headers are written; credentials never touch disk.
+    global _CAPTURE_SEQ
+    try:
+        CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+        with _CAPTURE_LOCK:
+            _CAPTURE_SEQ += 1
+            path = CAPTURE_DIR / f"request-{_CAPTURE_SEQ:04d}.txt"
+        lines = [request_line]
+        for name, value in headers:
+            lowered = name.lower()
+            if lowered in _CAPTURE_HEADER_ALLOW or lowered.startswith("x-codex"):
+                lines.append(f"{name}: {value}")
+        lines.append("")
+        lines.append(f"[body-bytes-with-headers: {len(remainder)}]")
+        lines.append(remainder[:8192].decode("utf-8", "replace"))
+        path.write_text("\n".join(lines), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def capture_request(request_line: str, encoding: str, body: bytes) -> None:
+    # Manual diagnostics only: enabled by touching capture.enabled. Writes the
+    # request line and decoded body to disk; never writes headers or credentials.
+    global _CAPTURE_SEQ
+    try:
+        CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+        with _CAPTURE_LOCK:
+            _CAPTURE_SEQ += 1
+            path = CAPTURE_DIR / f"request-{_CAPTURE_SEQ:04d}.txt"
+        payload = f"{request_line}\ncontent-encoding: {encoding}\n\n".encode() + body
+        path.write_bytes(payload)
+    except OSError:
+        pass
 PROTOCOL_VERSION = "2"
 
 
@@ -398,6 +446,8 @@ class ProxyHandler(socketserver.BaseRequestHandler):
         try:
             header, remainder = receive_headers(client)
             request_line, headers = parse_request(header)
+            if capture_enabled():
+                capture_probe(request_line, headers, remainder)
             if is_health_request(request_line):
                 send_health(client)
                 return
@@ -436,6 +486,8 @@ class ProxyHandler(socketserver.BaseRequestHandler):
                 tunnel(client, upstream)
                 return
             decoded = decode_request_body(body, encoding, max_bytes=MAX_FORWARD_BODY_BYTES)
+            if capture_enabled():
+                capture_request(request_line, encoding, decoded)
             try:
                 payload = json.loads(decoded)
             except (UnicodeDecodeError, json.JSONDecodeError):
