@@ -215,6 +215,12 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 
 测试全部使用临时目录或本机 mock 服务；真实 Provider 探针需要用户自己的已授权路由。
 
+## 版本记录
+
+- **V2**：从零安装、三端用户级常驻（macOS LaunchAgent / Linux systemd / Windows 任务计划）、API Key 与 OAuth Provider、事务回滚、Python 透明代理、通用 ProviderSpec、完整部署验收门槛。
+- **V2.1**：旧／新双协议上下文压缩、跨路由切换回放（唯一 `ocx1:` compaction item）、安全服务切换（异步 `bootout` 等待与 bootstrap 有界重试）。
+- **V2.1.1**：请求体 zstd 支持与未知编码安全透传（修复全模型 415）、受管模型 `comp_hash` 显式对齐（修复跨路由切换即压缩 fatal）、官方模型目录自动刷新（`catalog-refresh` + 6 小时 LaunchAgent 定时器）、请求捕获诊断、CLIProxyAPI 伪装层排障指引。
+
 ## 许可
 
 MIT。原作者与 V2 修改说明见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。

@@ -172,6 +172,12 @@ python3 -m py_compile scripts/bridge.py scripts/deployment.py scripts/compaction
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
+## Changelog
+
+- **V2**: zero-to-one installation, per-user services (macOS LaunchAgent / Linux systemd / Windows scheduled task), API-key and OAuth provider onboarding, transactional rollback, a dependency-free Python transparent proxy, generic ProviderSpec support, and end-to-end Codex acceptance gates.
+- **V2.1**: legacy/v2 dual-protocol context compaction, cross-route checkpoint replay (exactly one `ocx1:` compaction item), and guarded service handoff (async `bootout` wait with bounded bootstrap retries).
+- **V2.1.1**: zstd request bodies with safe pass-through of unknown encodings (fixes the blanket 415), explicit `comp_hash` alignment for managed models (fixes cross-route-switch compaction failures), automatic official catalog refresh (`catalog-refresh` plus a 6-hour LaunchAgent), request capture diagnostics, and CLIProxyAPI cloaking troubleshooting.
+
 ## License
 
 MIT. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

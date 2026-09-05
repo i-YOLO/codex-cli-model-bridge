@@ -1,4 +1,4 @@
-codex-cli-model-bridge V2.1
+codex-cli-model-bridge V2.1.1
 
 Official source:
 https://github.com/i-YOLO/codex-cli-model-bridge
@@ -12,6 +12,12 @@ Copyright (c) 2026 Zhijian AI
 V2/V2.1 deployment workflow, cross-platform bootstrap, provider presets,
 transactional rollback, Python transparent proxy, dual-protocol compaction,
 cross-route checkpoint replay, documentation, and tests:
+Copyright (c) 2026 JiMu
+
+V2.1.1 zstd request-body support, safe pass-through of unknown encodings,
+hardened asynchronous service restart, official catalog auto-refresh,
+managed comp_hash alignment, request capture diagnostics, and bilingual
+documentation:
 Copyright (c) 2026 JiMu
 
 The original MIT grant and upstream copyright are preserved. JiMu's V2/V2.1
