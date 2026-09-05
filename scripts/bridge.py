@@ -376,10 +376,14 @@ def catalog_policy(path: Path) -> dict:
         raise ValueError("protected_native_model_ids must be an array of non-empty strings")
     if len(protected) != len(set(protected)):
         raise ValueError("protected_native_model_ids must not contain duplicates")
+    managed_comp_hash = payload.get("managed_comp_hash", "")
+    if not isinstance(managed_comp_hash, str):
+        raise ValueError("managed_comp_hash must be a string")
     return {
         "schema_version": 1,
         "hidden_native_model_ids": hidden,
         "protected_native_model_ids": protected,
+        "managed_comp_hash": managed_comp_hash,
     }
 
 
@@ -1668,6 +1672,13 @@ def cmd_sync(args: argparse.Namespace) -> None:
             },
             2,
         )
+    # Third-party entries inherit comp_hash from their template model, and
+    # templates differ per manifest. A mixed set makes Codex checkpoint on every
+    # cross-route switch, so align all managed entries onto one explicit group.
+    managed_comp_hash = policy.get("managed_comp_hash")
+    if isinstance(managed_comp_hash, str) and managed_comp_hash:
+        for slug in desired:
+            desired[slug]["comp_hash"] = managed_comp_hash
     kept: list[dict] = []
     desired_ids = set(desired)
     for entry in native:
@@ -1693,6 +1704,9 @@ def cmd_sync(args: argparse.Namespace) -> None:
         slug for slug in managed_before if args.prune_managed and slug not in desired_ids and slug in current_map
     )
     unchanged = sorted(slug for slug in desired if slug in current_map and current_map[slug] == desired[slug])
+    managed_comp_hash_groups = sorted(
+        {final_map[slug].get("comp_hash") for slug in desired_ids if final_map.get(slug, {}).get("comp_hash")}
+    )
     changed = final_payload != current_payload
     result = {
         "status": "planned" if not args.apply else "unchanged",
@@ -1707,10 +1721,15 @@ def cmd_sync(args: argparse.Namespace) -> None:
         ),
         "hidden_native_models_not_found": sorted(hidden_native_ids - set(native_map)),
         "managed_after": sorted(desired_ids | (managed_before - set(removed))),
+        "managed_comp_hash_groups": managed_comp_hash_groups,
         "backup": None,
         "live_routes_verified": not args.skip_live_check,
         "secrets_redacted": True,
     }
+    if len(managed_comp_hash_groups) > 1:
+        result["warnings"] = [
+            "managed models span multiple comp_hash groups; cross-route switches will trigger remote compaction"
+        ]
     if args.apply:
         if changed:
             if target_path.exists():
@@ -1727,6 +1746,178 @@ def cmd_sync(args: argparse.Namespace) -> None:
         }
         atomic_write(state_path, json.dumps(next_state, ensure_ascii=False, indent=2) + "\n", 0o600)
     emit(result)
+
+
+def notify_desktop(title: str, message: str) -> None:
+    if platform.system() != "darwin":
+        return
+    escape = lambda text: text.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'display notification "{escape(message)}" with title "{escape(title)}"'
+    try:
+        subprocess.run(
+            ["osascript", "-e", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def detect_client_version(explicit: str | None) -> str | None:
+    if explicit:
+        return explicit
+    try:
+        proc = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    match = re.search(r"(\d+\.\d+\.\d+)", proc.stdout)
+    return match.group(1) if match else None
+
+
+def fetch_official_catalog(
+    base_url: str,
+    token: str,
+    account_id: str | None,
+    client_version: str | None,
+    previous: dict | None,
+) -> tuple[dict | None, str | None, str | None]:
+    """Fetch the official Codex model catalog. Returns (payload, etag, error)."""
+
+    url = base_url.rstrip("/") + "/models"
+    if client_version:
+        url += "?client_version=" + urllib.parse.quote(client_version)
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    if account_id:
+        headers["chatgpt-account-id"] = account_id
+    previous_etag = previous.get("etag") if isinstance(previous, dict) else None
+    if previous_etag:
+        headers["If-None-Match"] = previous_etag
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read()
+            etag = response.headers.get("ETag")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            return None, previous_etag, None
+        detail = redacted_error_tail(exc.read().decode("utf-8", "replace"), 200)
+        return None, None, f"HTTP {exc.code}: {detail}" if detail else f"HTTP {exc.code}"
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return None, None, f"{type(exc).__name__}: {redacted_error_tail(str(exc), 200)}"
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, None, "official catalog response is not valid JSON"
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list) or not models:
+        return None, None, "official catalog response has no models array"
+    for entry in models:
+        if not isinstance(entry, dict) or not isinstance(entry.get("slug"), str) or not entry["slug"]:
+            return None, None, "official catalog entries must carry non-empty string slugs"
+    return payload, etag, None
+
+
+def cmd_catalog_refresh(args: argparse.Namespace) -> None:
+    state_dir = Path(args.state_dir).expanduser()
+    official_path = state_dir / "official-catalog.json"
+    status_path = state_dir / "catalog-refresh-status.json"
+    auth = read_json(Path(args.auth_file).expanduser())
+    token = None
+    account_id = None
+    if isinstance(auth, dict):
+        tokens = auth.get("tokens")
+        if isinstance(tokens, dict):
+            value = tokens.get("access_token")
+            token = value if isinstance(value, str) and value else None
+        account = auth.get("account_id")
+        account_id = account if isinstance(account, str) and account else None
+    if not token:
+        emit(
+            {
+                "status": "blocked",
+                "error": "auth.json has no ChatGPT access token; official catalog refresh requires ChatGPT login",
+                "secrets_redacted": True,
+            },
+            2,
+        )
+    client_version = detect_client_version(args.client_version)
+    previous = read_json(official_path) if official_path.exists() else None
+    baseline = not isinstance(previous, dict)
+    # Reuse the etag only when the client version is unchanged; a new version
+    # can unlock additional models and must bypass the cached representation.
+    previous_version = previous.get("client_version") if isinstance(previous, dict) else None
+    revalidate = previous_version is not None and previous_version == client_version
+    payload, etag, error = fetch_official_catalog(
+        args.base_url,
+        token,
+        account_id,
+        client_version,
+        previous if isinstance(previous, dict) and revalidate else None,
+    )
+    if error:
+        emit({"status": "blocked", "error": f"official catalog fetch failed: {error}", "secrets_redacted": True}, 2)
+    if payload is None:
+        emit({"status": "unchanged", "detail": "official catalog reports 304 Not Modified", "secrets_redacted": True})
+        return
+    fresh_models = payload["models"]
+    fresh_slugs = {entry["slug"] for entry in fresh_models}
+    previous_models = previous.get("models") if isinstance(previous, dict) else None
+    previous_slugs = {entry.get("slug") for entry in previous_models} if isinstance(previous_models, list) else set()
+    added = sorted(fresh_slugs - previous_slugs)
+    removed = sorted(previous_slugs - fresh_slugs)
+    fetched_at = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    atomic_write(
+        official_path,
+        json.dumps(
+            {"fetched_at": fetched_at, "etag": etag, "client_version": client_version, "models": fresh_models},
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        0o600,
+    )
+    status = {
+        "fetched_at": fetched_at,
+        "etag": etag,
+        "client_version": client_version,
+        "baseline": baseline,
+        "added": added,
+        "removed": removed,
+        "applied": bool(args.apply),
+    }
+    atomic_write(status_path, json.dumps(status, ensure_ascii=False, indent=2) + "\n", 0o600)
+    # emit() always raises SystemExit, even on success, so this command prints
+    # its fetch status plainly and lets cmd_sync's own emit end the process.
+    print(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
+    try:
+        cmd_sync(
+            argparse.Namespace(
+                config=args.config,
+                catalog=args.catalog,
+                native_catalog=str(official_path),
+                catalog_policy=args.catalog_policy,
+                state_dir=args.state_dir,
+                models=None,
+                models_file=None,
+                adopt=False,
+                prune_managed=False,
+                skip_live_check=False,
+                apply=args.apply,
+            )
+        )
+    except SystemExit as exc:
+        if exc.code:
+            raise
+    if args.apply and added and not baseline and not args.no_notify:
+        preview = ", ".join(added[:3]) + (f" and {len(added) - 3} more" if len(added) > 3 else "")
+        notify_desktop(
+            "Codex Model Bridge",
+            f"Official catalog updated: +{len(added)} models ({preview}). Restart Codex Desktop to see them.",
+        )
 
 
 def probe_prompt(shell: bool, tool_sequence: bool, image_probe: bool = False) -> str:
@@ -2092,6 +2283,22 @@ def parser() -> argparse.ArgumentParser:
     sync.add_argument("--skip-live-check", action="store_true", help="Tests only; never use for live setup")
     sync.add_argument("--apply", action="store_true")
     sync.set_defaults(func=cmd_sync)
+
+    catalog_refresh = sub.add_parser(
+        "catalog-refresh",
+        help="Refresh native models from the official Codex backend catalog (ChatGPT login required)",
+    )
+    catalog_refresh.add_argument("--config", default=str(DEFAULT_PROFILE_CONFIG))
+    catalog_refresh.add_argument("--catalog", default=str(DEFAULT_CODEX_HOME / "model-catalog-cli-proxy.json"))
+    catalog_refresh.add_argument("--native-catalog", default=str(DEFAULT_STATE_DIR / "official-catalog.json"))
+    catalog_refresh.add_argument("--catalog-policy", default=str(DEFAULT_CATALOG_POLICY))
+    catalog_refresh.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR))
+    catalog_refresh.add_argument("--auth-file", default=str(DEFAULT_CODEX_HOME / "auth.json"))
+    catalog_refresh.add_argument("--base-url", default="https://chatgpt.com/backend-api/codex")
+    catalog_refresh.add_argument("--client-version")
+    catalog_refresh.add_argument("--no-notify", action="store_true")
+    catalog_refresh.add_argument("--apply", action="store_true")
+    catalog_refresh.set_defaults(func=cmd_catalog_refresh)
 
     probe = sub.add_parser("probe")
     probe.add_argument("--catalog")

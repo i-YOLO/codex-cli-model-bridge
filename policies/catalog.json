@@ -14,5 +14,6 @@
     "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.3-codex-spark"
-  ]
+  ],
+  "managed_comp_hash": "3000"
 }

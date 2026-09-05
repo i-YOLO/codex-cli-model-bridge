@@ -99,6 +99,22 @@ See [Compaction and cross-route checkpoints](references/compaction.md) for the f
 
 To debug an awkward compaction or routing shape, create `~/.config/codex-cli-model-bridge/capture.enabled` and reproduce once. The proxy then writes each request line, allow-listed headers, and the decoded body into the `capture/` folder next to it; it never writes `Authorization` or any other credential header. Delete the sentinel file and the `capture/` folder to switch capture off.
 
+## Automatic official catalog refresh
+
+`model_catalog_json` is a static file, and Codex stops refreshing its own catalog cache once it is set, so newly released official models never appear on their own. The Skill ships two layers:
+
+- Manual: `python3 scripts/bridge.py catalog-refresh` (preview), add `--apply` to write. The command reads the official catalog with the ChatGPT login from `~/.codex/auth.json` (the credential lives only inside the process; it is never printed or logged) and then rebuilds the catalog through `sync`: the native layer follows the latest official data while managed third-party entries are preserved.
+- Automatic (macOS): `python3 scripts/bridge.py catalog-timer --apply` installs a per-user LaunchAgent that refreshes every 6 hours (`--interval-seconds` to change, `--remove --apply` to uninstall).
+
+Two behaviors worth knowing:
+
+1. **The backend gates new models by client version.** A freshly released model is only returned to a sufficiently new `client_version`; `catalog-refresh` auto-detects the installed `codex --version`, so after upgrading Codex the next refresh picks up new models with no manual steps.
+2. **The `comp_hash` of third-party models is pinned by the policy field `managed_comp_hash`** (default `3000`) and is re-applied on every refresh, so it never drifts with official templates; native entries always keep their upstream value. Results and the last failure reason are recorded in `~/.config/codex-cli-model-bridge/catalog-refresh-status.json`.
+
+When refresh finds newly added models, macOS shows a system notification reminding you to restart Codex Desktop. Onboarding a new third-party model still requires the manifest plus `verify` acceptance gates and is never automated.
+
+If a brand-new official model fails with `unknown provider for model`, the backend is gating it by client version while CLIProxyAPI's codex cloaking stamps an outdated client identity. Upgrade Codex first, then set `disable-codex-cloaking: true` in the CLIProxyAPI `config.yaml` (hot-reloaded, no restart needed) and retry.
+
 ## Provider presets
 
 - `gemini-api`: Gemini API key, with an optional user-supplied HTTPS relay.

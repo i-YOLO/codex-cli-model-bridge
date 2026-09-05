@@ -51,3 +51,9 @@ Provider configs and their backups may contain API keys and must remain owner-on
 ## Desktop failure behavior
 
 Desktop activation is a second transaction after profile activation. If its guard or health check fails, restore root `config.toml`, stop the newly created 8318 service, retain the working profile/catalog/helper, and report `codex --profile cli-proxy -m <model>`.
+
+## Catalog auto-refresh
+
+`model_catalog_json` freezes the native model list; new upstream releases never appear until the catalog file is rebuilt. `bridge.py catalog-refresh` fetches the official catalog from `{chatgpt_base_url}/backend-api/codex/models?client_version=<installed codex version>` with the ChatGPT login from `auth.json`, caches it as `official-catalog.json` in the state directory, and rebuilds the managed catalog through the `sync` rules: native entries follow the official data, managed third-party entries stay aligned on `catalog-policy.json` → `managed_comp_hash`, and the transaction keeps owner-only backups plus a diff report.
+
+On macOS, `bridge.py catalog-timer --apply` installs a user LaunchAgent (`com.zhijian.codex-cli-model-bridge.catalog-refresh`, default every 6 hours, `RunAtLoad`) so the refresh runs unattended; `--remove --apply` uninstalls it. The backend gates freshly released models by `client_version`, so a new model appears only after Codex itself is upgraded and the next refresh runs. On Windows and Linux, schedule `bridge.py catalog-refresh --apply` with schtasks or a systemd user timer instead. Refresh status and the last failure land in `catalog-refresh-status.json`; the log output of the timer is appended to `catalog-refresh.log` in the state directory.

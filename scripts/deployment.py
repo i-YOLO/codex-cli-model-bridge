@@ -2103,6 +2103,126 @@ def cmd_rollback(args: argparse.Namespace) -> None:
         emit({"status": "blocked", "error": str(exc), "transaction": args.transaction}, 2)
 
 
+CATALOG_TIMER_LABEL = "com.zhijian.codex-cli-model-bridge.catalog-refresh"
+
+
+def catalog_timer_plist(bridge_script: Path, state_dir: Path, interval_seconds: int, python_executable: str) -> bytes:
+    payload = {
+        "Label": CATALOG_TIMER_LABEL,
+        "ProgramArguments": [python_executable, str(bridge_script), "catalog-refresh", "--apply"],
+        "StartInterval": interval_seconds,
+        "RunAtLoad": True,
+        "StandardOutPath": str(state_dir / "catalog-refresh.log"),
+        "StandardErrorPath": str(state_dir / "catalog-refresh.log"),
+        "ProcessType": "Background",
+    }
+    return plistlib.dumps(payload)
+
+
+def cmd_catalog_timer(args: argparse.Namespace) -> None:
+    if platform.system() != "Darwin":
+        emit(
+            {
+                "status": "blocked",
+                "error": "the catalog timer currently supports macOS launchd; schedule bridge.py catalog-refresh --apply with schtasks or a systemd timer elsewhere",
+            },
+            2,
+        )
+    domain = f"gui/{os.getuid()}"
+    target = f"{domain}/{CATALOG_TIMER_LABEL}"
+    plist_path = Path("~/Library/LaunchAgents").expanduser() / f"{CATALOG_TIMER_LABEL}.plist"
+    if args.remove:
+        if not args.apply:
+            emit({"status": "planned", "action": "remove", "plist": str(plist_path), "target": target})
+            return
+        loaded = subprocess.run(
+            ["launchctl", "print", target],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode == 0
+        if loaded:
+            subprocess.run(
+                ["launchctl", "bootout", target],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        if plist_path.exists():
+            plist_path.unlink()
+        emit({"status": "applied", "action": "remove", "plist": str(plist_path), "secrets_redacted": True})
+        return
+    interval = max(600, int(args.interval_seconds))
+    state_dir = Path(args.state_dir).expanduser()
+    payload = catalog_timer_plist(Path(args.bridge_script).expanduser(), state_dir, interval, sys.executable)
+    preview = plistlib.loads(payload)
+    if not args.apply:
+        emit(
+            {
+                "status": "planned",
+                "action": "install",
+                "plist": str(plist_path),
+                "target": target,
+                "interval_seconds": interval,
+                "program_arguments": preview.get("ProgramArguments"),
+                "secrets_redacted": True,
+            }
+        )
+        return
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    if plist_path.exists():
+        backup_path = plist_path.with_name(plist_path.name + ".bak-timer")
+        backup_path.write_bytes(plist_path.read_bytes())
+    atomic_write_bytes(plist_path, payload, 0o600)
+    loaded = subprocess.run(
+        ["launchctl", "print", target],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode == 0
+    if loaded:
+        subprocess.run(
+            ["launchctl", "bootout", target],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        for _ in range(20):
+            if (
+                subprocess.run(
+                    ["launchctl", "print", target],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                ).returncode
+                != 0
+            ):
+                break
+            time.sleep(0.5)
+    last_error = "launchctl failed to load the catalog timer"
+    for _ in range(3):
+        started = subprocess.run(
+            ["launchctl", "bootstrap", domain, str(plist_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if started.returncode == 0:
+            emit(
+                {
+                    "status": "applied",
+                    "action": "install",
+                    "plist": str(plist_path),
+                    "target": target,
+                    "interval_seconds": interval,
+                    "secrets_redacted": True,
+                }
+            )
+            return
+        time.sleep(1.0)
+    emit({"status": "blocked", "error": last_error, "plist": str(plist_path), "secrets_redacted": True}, 2)
+
+
 def register_deployment_parsers(sub: argparse._SubParsersAction) -> None:
     bootstrap = sub.add_parser("bootstrap", help="Adopt or install a verified CLIProxyAPI runtime")
     bootstrap.add_argument("--proxy-binary")
@@ -2115,6 +2235,17 @@ def register_deployment_parsers(sub: argparse._SubParsersAction) -> None:
     bootstrap.add_argument("--no-service", action="store_true")
     bootstrap.add_argument("--apply", action="store_true")
     bootstrap.set_defaults(func=cmd_bootstrap)
+
+    catalog_timer = sub.add_parser(
+        "catalog-timer",
+        help="Install or remove the macOS LaunchAgent that auto-refreshes the model catalog",
+    )
+    catalog_timer.add_argument("--state-dir", default=str(DEFAULT_STATE_DIR))
+    catalog_timer.add_argument("--bridge-script", default=str(SKILL_DIR / "scripts" / "bridge.py"))
+    catalog_timer.add_argument("--interval-seconds", type=int, default=21600)
+    catalog_timer.add_argument("--remove", action="store_true")
+    catalog_timer.add_argument("--apply", action="store_true")
+    catalog_timer.set_defaults(func=cmd_catalog_timer)
 
     provider = sub.add_parser("provider", help="Manage upstream provider definitions")
     provider_sub = provider.add_subparsers(dest="provider_command", required=True)

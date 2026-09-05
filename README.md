@@ -127,6 +127,20 @@ python3 scripts/bridge.py compaction verify --models all
 
 排查压缩或路由的疑难请求形状时，创建 `~/.config/codex-cli-model-bridge/capture.enabled` 并重现一次；代理会把请求行、白名单请求头与解码后的请求体写入同目录的 `capture/` 子文件夹（绝不写入 `Authorization` 或其他凭据头）。诊断结束删除哨兵文件与 `capture/` 目录即可关闭。
 
+## 官方模型目录自动刷新
+
+`model_catalog_json` 是静态文件，Codex 设置它之后就不再刷新官方目录缓存，官方新模型不会自己出现。Skill 提供两层机制：
+
+- 手动：`python3 scripts/bridge.py catalog-refresh`（预览）→ 加 `--apply` 落盘。命令用本机 `~/.codex/auth.json` 的 ChatGPT 登录直接读取官方目录（凭据只在本进程内存中使用，绝不打印或写日志），随后复用 `sync` 重建目录：原生层取官方最新，第三方受管条目保留。
+- 自动（macOS）：`python3 scripts/bridge.py catalog-timer --apply` 安装用户级 LaunchAgent，每 6 小时自动执行一次刷新（`--interval-seconds` 可调，`--remove --apply` 卸载）。
+
+两点行为要知道：
+
+1. **官方按客户端版本下发新模型**。实测新模型只在足够新的 `client_version` 下返回；`catalog-refresh` 自动探测本机 `codex --version` 作为版本号，所以升级 Codex 之后第一次刷新，新模型就会自动进目录，不需要任何手工步骤。
+2. **第三方模型的 `comp_hash` 由 policy 的 `managed_comp_hash` 显式固定**（默认 `3000`），每次刷新自动覆盖，不随官方模板漂移；原生条目一律保持官方原值。刷新结果与最近一次失败原因记录在 `~/.config/codex-cli-model-bridge/catalog-refresh-status.json`。
+
+刷新若发现新增模型，macOS 会弹一条系统通知提醒重启 Codex Desktop。第三方新模型的接入仍然走 manifest + verify 的人工验收门槛，不自动化。
+
 ## Gemini
 
 Skill 不会自动猜认证方式。每次应先选择：
@@ -171,6 +185,7 @@ python3 scripts/bridge.py provider add --spec /absolute/path/provider.json
 | 压缩请求 `/responses/compact` 返回 404/501 | 检查 `remote_compaction_v2` 与 8318 协议版本 | 不把 `false` 当本地压缩 |
 | 跨路由换模型立即压缩并报 `expected exactly one compaction output item` | 检查模型目录第三方条目的 `comp_hash` 是否不再一致 | 不删除目录条目，也不伪造更大的 context window |
 | 全部模型请求统一 415 | 查 8318 health 的 `last_error_type`（常见为新版请求压缩编码） | 不重装 Codex，也不重登账号 |
+| 新官方模型报 `unknown provider for model` | 后端按客户端版本门控新模型，而 CLIProxyAPI 伪装层带旧版本标识；升级 Codex 后确认 `config.yaml` 的 `disable-codex-cloaking: true`（热加载，免重启） | 不回退 Codex，也不删除目录条目 |
 | 跨路由换模型后立即压缩 | 这是路由边界 checkpoint；验证 v2 与回放 marker | 不伪造更大的 context window，也不关闭压缩 |
 | `compaction_trigger` 只返回普通 message | 启用同模型 `ocx1:` 适配并要求唯一 compaction item | 不把普通 assistant 摘要当压缩成功 |
 | 历史“消失” | 对比根 Provider 与任务 Provider 分布 | 不修改 SQLite 任务行 |
