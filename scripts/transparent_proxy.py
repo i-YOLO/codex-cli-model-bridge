@@ -29,7 +29,6 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from compaction import (  # noqa: E402
     CompactionError,
-    MAX_COMPACTION_BODY_BYTES,
     build_summary_payload,
     build_v1_output,
     build_v2_failure_events,
@@ -499,8 +498,10 @@ class ProxyHandler(socketserver.BaseRequestHandler):
 
             model = payload.get("model") if isinstance(payload.get("model"), str) else "unknown"
             stream = payload.get("stream") is True
-            if (is_legacy_compaction_path(path) or is_v2_compaction_request(payload)) and len(decoded) > MAX_COMPACTION_BODY_BYTES:
-                raise CompactionError("request body exceeds 32 MiB after decoding")
+            # No extra body-size gate here: decoding already caps at
+            # MAX_FORWARD_BODY_BYTES, native compaction is forwarded untouched,
+            # and the third-party summary call strips images and tools, so the
+            # re-sent payload stays small regardless of the original size.
             if is_legacy_compaction_path(path):
                 STATS.add("v1_requests")
                 try:
