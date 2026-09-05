@@ -1695,6 +1695,12 @@ def cmd_sync(args: argparse.Namespace) -> None:
             continue
         kept.append(copy.deepcopy(entry))
     final_models = kept + [desired[manifest["slug"]] for manifest in manifests]
+    # 8318 routes each request by the model inside its body, which is only
+    # possible over plain HTTPS; a websocket connection cannot be split per
+    # model, so every catalog entry opts out of the responses websocket
+    # transport regardless of its upstream default.
+    for entry in final_models:
+        entry["prefer_websockets"] = False
     final_map = {entry["slug"]: entry for entry in final_models}
     final_payload = {"models": final_models}
     current_payload = {"models": current}

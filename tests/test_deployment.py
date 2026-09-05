@@ -509,6 +509,7 @@ class TransparentProxyIntegrationTests(unittest.TestCase):
                 "CODEX_BRIDGE_HELPER": str(helper),
                 "CODEX_BRIDGE_HELPER_CMD": sys.executable,
                 "CODEX_BRIDGE_HELPER_ARGS": "[]",
+                "CODEX_BRIDGE_NATIVE_BACKEND_URL": f"http://127.0.0.1:{self.upstream.server_address[1]}/backend-api/codex",
             }
         )
         self.proxy = subprocess.Popen(
@@ -649,23 +650,26 @@ class TransparentProxyIntegrationTests(unittest.TestCase):
         self.assertEqual(models, ["cross-route-target"] * 3)
         self.assertNotIn("gpt-5.6-sol", models)
 
-    def test_native_reasoning_content_is_removed_before_forward(self) -> None:
-        response = self.request(
-            "/v1/responses",
-            {
-                "model": "gpt-test",
-                "input": [
-                    {"type": "reasoning", "content": [1, 2], "summary": [{"type": "summary_text", "text": "keep"}]},
-                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
-                ],
-                "stream": False,
-            },
-        )
+    def test_native_reasoning_content_is_removed_before_direct_forward(self) -> None:
+        payload = {
+            "model": "gpt-test",
+            "input": [
+                {"type": "reasoning", "content": [1, 2], "summary": [{"type": "summary_text", "text": "keep"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]},
+            ],
+            "stream": False,
+        }
+        response = self.request("/v1/responses", payload)
         self.assertIn(b"200 OK", response)
-        captured = self.upstream.captured_requests[-1].split(b"\r\n\r\n", 1)[1]  # type: ignore[attr-defined]
-        forwarded = json.loads(captured)
+        request_line, body = self.upstream.captured_requests[-1].split(b"\r\n\r\n", 1)  # type: ignore[attr-defined]
+        # Native requests leave the bridge for the official backend with the
+        # client's own Authorization and the ocx1/cleanup pass applied.
+        self.assertIn(b"POST /backend-api/codex/responses HTTP/1.1", request_line)
+        self.assertIn(b"Authorization: Bearer desktop-token", request_line)
+        forwarded = json.loads(body)
         self.assertNotIn("content", forwarded["input"][0])
         self.assertEqual(forwarded["input"][0]["summary"][0]["text"], "keep")
+        self.assertEqual(forwarded["input"][1]["content"][0]["text"], "continue")
 
     def test_replay_supports_gzip_and_deflate_and_updates_length(self) -> None:
         for encoding in ("gzip", "deflate"):

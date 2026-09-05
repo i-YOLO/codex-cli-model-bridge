@@ -14,6 +14,7 @@ from pathlib import Path
 import selectors
 import socket
 import socketserver
+import ssl
 import subprocess
 import sys
 import threading
@@ -48,6 +49,17 @@ LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = int(os.environ.get("CODEX_BRIDGE_LISTEN_PORT", "8318"))
 UPSTREAM_HOST = "127.0.0.1"
 UPSTREAM_PORT = int(os.environ.get("CODEX_BRIDGE_UPSTREAM_PORT", "8317"))
+# Native models bypass CLIProxyAPI entirely and talk to the official backend
+# with the client's own login; only third-party routes enter the proxy pool.
+NATIVE_BACKEND_URL = os.environ.get(
+    "CODEX_BRIDGE_NATIVE_BACKEND_URL",
+    "https://chatgpt.com/backend-api/codex",
+)
+_native_backend = urllib.parse.urlparse(NATIVE_BACKEND_URL)
+NATIVE_BACKEND_TLS = _native_backend.scheme == "https"
+NATIVE_BACKEND_HOST = _native_backend.hostname or "chatgpt.com"
+NATIVE_BACKEND_PORT = _native_backend.port or (443 if NATIVE_BACKEND_TLS else 80)
+NATIVE_BACKEND_API_PREFIX = _native_backend.path.rstrip("/")
 MAX_HEADER_BYTES = 64 * 1024
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_FORWARD_BODY_BYTES = 128 * 1024 * 1024
@@ -410,6 +422,77 @@ def send_v2_failure(client: socket.socket, model: str, stream: bool, error_type:
         send_error(client, 502, error_type)
 
 
+def routing_hint_model(headers: list[tuple[str, str]]) -> str | None:
+    value = header_value(headers, "x-codex-routing-hint")
+    if value and value.startswith("model="):
+        model = value.split("=", 1)[1].strip()
+        return model or None
+    return None
+
+
+def render_native_request(request_line: str, headers: list[tuple[str, str]], body_length: int | None) -> bytes:
+    # Native models leave the bridge as the original client request: path and
+    # Host are rewritten for the official backend while the client's own
+    # Authorization and every other header are preserved verbatim.
+    method, path = request_parts(request_line)
+    suffix = path[len("/v1"):] if path.startswith("/v1/") else path
+    lines = [f"{method} {NATIVE_BACKEND_API_PREFIX}{suffix} HTTP/1.1"]
+    saw_length = False
+    for name, value in headers:
+        lowered = name.lower()
+        if lowered == "host":
+            continue
+        if lowered == "content-length" and body_length is not None:
+            lines.append(f"{name}: {body_length}")
+            saw_length = True
+            continue
+        if lowered == "transfer-encoding" and body_length is not None:
+            continue
+        lines.append(f"{name}: {value}")
+    if body_length is not None and not saw_length:
+        lines.append(f"Content-Length: {body_length}")
+    lines.append(f"Host: {NATIVE_BACKEND_HOST}")
+    lines.append("")
+    lines.append("")
+    return "\r\n".join(lines).encode("iso-8859-1")
+
+
+def native_direct_forward(
+    client: socket.socket,
+    request_line: str,
+    headers: list[tuple[str, str]],
+    body: bytes | None,
+) -> None:
+    # The client already sent its complete body, so only the TLS response has
+    # to be relayed back; a one-direction pump is enough and keeps SSE intact.
+    STATS.add("native_direct_requests")
+    upstream = socket.create_connection((NATIVE_BACKEND_HOST, NATIVE_BACKEND_PORT), timeout=15)
+    try:
+        if NATIVE_BACKEND_TLS:
+            context = ssl.create_default_context()
+            upstream = context.wrap_socket(upstream, server_hostname=NATIVE_BACKEND_HOST)
+        upstream.settimeout(None)
+        client.settimeout(None)
+        body_length = len(body) if body is not None else None
+        upstream.sendall(render_native_request(request_line, headers, body_length) + (body or b""))
+        while True:
+            try:
+                chunk = upstream.recv(64 * 1024)
+            except ssl.SSLWantReadError:
+                continue
+            if not chunk:
+                break
+            client.sendall(chunk)
+    except OSError as exc:
+        STATS.failure(f"native_direct {type(exc).__name__}: {exc}")
+        raise
+    finally:
+        try:
+            upstream.close()
+        except OSError:
+            pass
+
+
 def tunnel(left: socket.socket, right: socket.socket) -> None:
     selector = selectors.DefaultSelector()
     selector.register(left, selectors.EVENT_READ, right)
@@ -454,6 +537,16 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             method, path = request_parts(request_line)
             managed_path = method == "POST" and (is_responses_path(path) or is_legacy_compaction_path(path))
             if not managed_path or is_upgrade(headers):
+                hint_model = routing_hint_model(headers)
+                if (
+                    not is_upgrade(headers)
+                    and method == "GET"
+                    and is_responses_path(path)
+                    and hint_model
+                    and is_native_compaction_model(hint_model)
+                ):
+                    native_direct_forward(client, request_line, headers, None)
+                    return
                 upstream = socket.create_connection((UPSTREAM_HOST, UPSTREAM_PORT), timeout=10)
                 upstream.settimeout(None)
                 client.settimeout(None)
@@ -502,6 +595,23 @@ class ProxyHandler(socketserver.BaseRequestHandler):
             # MAX_FORWARD_BODY_BYTES, native compaction is forwarded untouched,
             # and the third-party summary call strips images and tools, so the
             # re-sent payload stays small regardless of the original size.
+            if is_native_compaction_model(model):
+                # Native requests still pass through the ocx1 decode and the
+                # invalid-reasoning cleanup before leaving the bridge, so a
+                # thread that once ran on third-party models stays replayable
+                # on the official backend. The body is re-sent as plain JSON,
+                # therefore the original content-encoding header is dropped.
+                updated, changes = prepare_forward_payload(payload)
+                STATS.add("replay_decodes", changes["decoded_compactions"])
+                STATS.add("reasoning_items_cleaned", changes["reasoning_items_cleaned"])
+                rendered = json.dumps(updated, ensure_ascii=False, separators=(",", ":")).encode()
+                forward_headers = [
+                    (name, value)
+                    for name, value in headers
+                    if name.lower() != "content-encoding"
+                ]
+                native_direct_forward(client, request_line, forward_headers, rendered)
+                return
             if is_legacy_compaction_path(path):
                 STATS.add("v1_requests")
                 try:

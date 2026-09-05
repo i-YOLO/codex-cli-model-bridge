@@ -10,12 +10,23 @@ This is an MIT-licensed derivative of [Zhijian AI's `codex-cli-model-bridge`](ht
 
 ```text
 Codex Desktop / CLI (model_provider = openai)
-  -> 127.0.0.1:8318 Authorization + compaction compatibility proxy
-  -> 127.0.0.1:8317 CLIProxyAPI
-  -> native GPT plus explicitly configured third-party routes
+          |
+          v
+127.0.0.1:8318  model-aware transparent gateway
+  |-- Native models (GPT-5.6 / GPT-6 Astra, ...)
+  |     `-- forwarded verbatim to chatgpt.com with the Desktop login
+  `-- Third-party models (Gemini / DeepSeek / GLM / Grok, ...)
+        `-- 127.0.0.1:8317 CLIProxyAPI
+              |-- Gemini API Key / Antigravity OAuth
+              |-- DeepSeek Responses
+              |-- GLM standard API / Coding Plan
+              `-- other verified compatible providers
 ```
 
-The model catalog controls picker metadata, not per-model Provider routing. Mixed Desktop mode therefore requires every selected route to be available through the single local Responses endpoint.
+- **Native direct**: the official backend gates new models by client version, so native requests are forwarded with the real Desktop login and headers; native quota follows whatever account is logged into Desktop, and CPA restarts or failures never affect native models.
+- **Third-party isolation**: third-party traffic enters the CLIProxyAPI credential pool, while 8318 performs the dual-protocol compaction adaptation, `ocx1:` replay, and reasoning cleanup.
+- **No websockets**: 8318 routes each request by the model inside its body, and a websocket connection cannot be split per model, so every catalog entry carries `prefer_websockets=false` and all traffic uses HTTPS streaming (SSE).
+- The model catalog controls picker metadata, not per-model Provider routing. The mixed picker relies on 8318's model-aware split plus CLIProxyAPI's third-party routing.
 
 ## Install the Skill
 

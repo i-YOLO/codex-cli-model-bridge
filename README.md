@@ -24,18 +24,21 @@ Codex Desktop / CLI
   model_provider = openai
           │
           ▼
-127.0.0.1:8318  本机 Authorization + 双协议压缩适配
-          │
-          ▼
-127.0.0.1:8317  CLIProxyAPI
-          ├── Codex OAuth → 原生 GPT
-          ├── Gemini API Key / Antigravity OAuth
-          ├── DeepSeek Responses
-          ├── GLM 普通 API / Coding Plan
-          └── 其他已验证兼容 Provider
+127.0.0.1:8318  按模型分流的透明网关
+  ├── 原生模型（GPT-5.6／GPT-6 Astra…）
+  │     └── 原样直连 chatgpt.com 官方后端（使用 Desktop 自己的登录与原始请求头）
+  └── 第三方模型（Gemini／DeepSeek／GLM／Grok…）
+        └── 127.0.0.1:8317  CLIProxyAPI
+              ├── Gemini API Key / Antigravity OAuth
+              ├── DeepSeek Responses
+              ├── GLM 普通 API / Coding Plan
+              └── 其他已验证兼容 Provider
 ```
 
-模型目录只决定“菜单里显示什么”，不会决定每个模型走哪个 Provider。混合菜单依赖 CLIProxyAPI 在同一 Responses 入口完成真实路由。
+- **原生模型直连**：官方后端按客户端版本门控新模型，直连转发使用 Desktop 真实的登录与请求头，新模型永远以最新客户端身份出现；原生额度跟随 Desktop 登录的账号，CPA 重启或故障不影响原生模型。
+- **第三方隔离**：第三方流量进入 CLIProxyAPI 凭据池，8318 负责双协议压缩适配、`ocx1:` 回放与 reasoning 清理。
+- **无 WebSocket**：8318 按请求体里的 `model` 分流，而 WebSocket 连接建立时无法得知模型，因此目录内所有条目 `prefer_websockets=false`，全部走 HTTPS 流式（SSE）。
+- 模型目录只决定“菜单里显示什么”，不会决定每个模型走哪个 Provider。混合菜单依赖 8318 的按模型分流与 CLIProxyAPI 的第三方路由。
 
 ## 安装 Skill
 
